@@ -1460,7 +1460,7 @@ private final class SyncRulesWindowController: NSWindowController, NSTableViewDa
         self.saveRules = saveRules
         self.runRule = runRule
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 820, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 920, height: 470),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -1482,7 +1482,7 @@ private final class SyncRulesWindowController: NSWindowController, NSTableViewDa
         switch identifier {
         case "local": text = rule.localFolder
         case "remote": text = rule.remoteFolder
-        case "direction": text = directionText(rule.direction)
+        case "direction": text = syncActionsText(rule)
         case "schedule":
             let changeMode = rule.syncOnLocalChanges == true ? "变更后自动" : ""
             text = changeMode.isEmpty ? "每 \(rule.intervalMinutes) 分钟" : "\(changeMode) + 每 \(rule.intervalMinutes) 分钟"
@@ -1562,8 +1562,8 @@ private final class SyncRulesWindowController: NSWindowController, NSTableViewDa
         table.rowHeight = 30
         table.addTableColumn(column("local", title: "本地文件夹", width: 210))
         table.addTableColumn(column("remote", title: "远端文件夹", width: 135))
-        table.addTableColumn(column("direction", title: "方向", width: 110))
-        table.addTableColumn(column("schedule", title: "执行方式", width: 155))
+        table.addTableColumn(column("direction", title: "同步操作", width: 220))
+        table.addTableColumn(column("schedule", title: "执行方式", width: 145))
         table.addTableColumn(column("state", title: "状态", width: 70))
         table.addTableColumn(column("last", title: "上次同步", width: 120))
         let scroll = NSScrollView()
@@ -1629,12 +1629,13 @@ private final class SyncRulesWindowController: NSWindowController, NSTableViewDa
         return view
     }
 
-    private func directionText(_ direction: SyncDirection) -> String {
-        switch direction {
-        case .uploadOnly: return "仅上传"
-        case .downloadOnly: return "仅下载"
-        case .bidirectional: return "保留较新版本"
-        }
+    private func syncActionsText(_ rule: SyncRule) -> String {
+        var actions: [String] = []
+        if rule.uploadsLocalChanges { actions.append("本地上传") }
+        if rule.downloadsRemoteChanges { actions.append("远端下载") }
+        if rule.propagatesLocalDeletes { actions.append("本地删除 -> 远端") }
+        if rule.propagatesRemoteDeletes { actions.append("远端删除 -> 本地") }
+        return actions.isEmpty ? "未选择" : actions.joined(separator: "、")
     }
 }
 
@@ -1645,8 +1646,11 @@ private final class SyncRuleEditorWindowController: NSWindowController {
     private let client: any RemoteClient
     private let saveRule: (SyncRule) -> Void
     private let remote = NSTextField(string: "/")
-    private let direction = NSPopUpButton()
     private let interval = NSPopUpButton()
+    private let uploadLocalChanges = NSButton(checkboxWithTitle: "本地新增和修改上传到远端", target: nil, action: nil)
+    private let downloadRemoteChanges = NSButton(checkboxWithTitle: "远端新增和修改下载到本地", target: nil, action: nil)
+    private let deleteRemoteWhenLocalDeleted = NSButton(checkboxWithTitle: "本地删除时删除远端对应项目", target: nil, action: nil)
+    private let deleteLocalWhenRemoteDeleted = NSButton(checkboxWithTitle: "远端删除时删除本地对应项目", target: nil, action: nil)
     private let watchChanges = NSButton(checkboxWithTitle: "检测到本地文件夹变化后自动同步", target: nil, action: nil)
     private var folderPicker: RemoteFolderPickerWindowController?
 
@@ -1656,14 +1660,13 @@ private final class SyncRuleEditorWindowController: NSWindowController {
         self.client = client
         self.saveRule = saveRule
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 250),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 345),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
         window.title = existing == nil ? "添加同步规则" : "编辑同步规则"
         super.init(window: window)
-        direction.addItems(withTitles: ["仅上传本地变更", "仅下载远端变更", "保留较新版本"])
         interval.addItems(withTitles: ["5 分钟", "15 分钟", "30 分钟", "1 小时"])
         applyExistingRule()
         window.contentView = makeContentView(window: window)
@@ -1690,12 +1693,17 @@ private final class SyncRuleEditorWindowController: NSWindowController {
             alert.beginSheetModal(for: window!) { _ in }
             return
         }
-        let directionValue: SyncDirection
-        switch direction.indexOfSelectedItem {
-        case 1: directionValue = .downloadOnly
-        case 2: directionValue = .bidirectional
-        default: directionValue = .uploadOnly
+        let uploadsLocal = uploadLocalChanges.state == .on
+        let downloadsRemote = downloadRemoteChanges.state == .on
+        let deletesRemote = deleteRemoteWhenLocalDeleted.state == .on
+        let deletesLocal = deleteLocalWhenRemoteDeleted.state == .on
+        guard uploadsLocal || downloadsRemote || deletesRemote || deletesLocal else {
+            let alert = NSAlert()
+            alert.messageText = "请至少选择一项同步操作。"
+            alert.beginSheetModal(for: window!) { _ in }
+            return
         }
+        let directionValue: SyncDirection = uploadsLocal && downloadsRemote ? .bidirectional : downloadsRemote ? .downloadOnly : .uploadOnly
         let minutes = [5, 15, 30, 60][max(0, interval.indexOfSelectedItem)]
         let rule = SyncRule(
             id: existing?.id ?? UUID(),
@@ -1706,6 +1714,10 @@ private final class SyncRuleEditorWindowController: NSWindowController {
             intervalMinutes: minutes,
             isEnabled: existing?.isEnabled ?? true,
             syncOnLocalChanges: watchChanges.state == .on,
+            uploadLocalChanges: uploadsLocal,
+            downloadRemoteChanges: downloadsRemote,
+            deleteRemoteWhenLocalDeleted: deletesRemote,
+            deleteLocalWhenRemoteDeleted: deletesLocal,
             lastSyncedAt: existing?.lastSyncedAt
         )
         saveRule(rule)
@@ -1715,14 +1727,14 @@ private final class SyncRuleEditorWindowController: NSWindowController {
     private func applyExistingRule() {
         guard let existing else {
             interval.selectItem(at: 1)
+            uploadLocalChanges.state = .on
             return
         }
         remote.stringValue = existing.remoteFolder
-        switch existing.direction {
-        case .uploadOnly: direction.selectItem(at: 0)
-        case .downloadOnly: direction.selectItem(at: 1)
-        case .bidirectional: direction.selectItem(at: 2)
-        }
+        uploadLocalChanges.state = existing.uploadsLocalChanges ? .on : .off
+        downloadRemoteChanges.state = existing.downloadsRemoteChanges ? .on : .off
+        deleteRemoteWhenLocalDeleted.state = existing.propagatesLocalDeletes ? .on : .off
+        deleteLocalWhenRemoteDeleted.state = existing.propagatesRemoteDeletes ? .on : .off
         let intervalIndex = [5, 15, 30, 60].firstIndex(of: existing.intervalMinutes) ?? 1
         interval.selectItem(at: intervalIndex)
         watchChanges.state = existing.syncOnLocalChanges == true ? .on : .off
@@ -1736,10 +1748,19 @@ private final class SyncRuleEditorWindowController: NSWindowController {
         let remoteRow = NSStackView(views: [remote, remotePicker])
         remoteRow.orientation = .horizontal
         remoteRow.spacing = 8
+        let syncActions = NSStackView(views: [
+            uploadLocalChanges,
+            downloadRemoteChanges,
+            deleteRemoteWhenLocalDeleted,
+            deleteLocalWhenRemoteDeleted
+        ])
+        syncActions.orientation = .vertical
+        syncActions.alignment = .leading
+        syncActions.spacing = 6
         let fields: [(String, NSView)] = [
             ("本地文件夹", local),
             ("远端文件夹", remoteRow),
-            ("同步方向", direction),
+            ("同步操作", syncActions),
             ("执行频率", interval),
             ("自动同步", watchChanges)
         ]

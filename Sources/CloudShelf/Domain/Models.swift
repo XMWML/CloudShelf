@@ -132,6 +132,11 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
     public var intervalMinutes: Int
     public var isEnabled: Bool
     public var syncOnLocalChanges: Bool?
+    // Optional fields preserve the behavior of profiles written before configurable sync actions existed.
+    public var uploadLocalChanges: Bool?
+    public var downloadRemoteChanges: Bool?
+    public var deleteRemoteWhenLocalDeleted: Bool?
+    public var deleteLocalWhenRemoteDeleted: Bool?
     public var lastSyncedAt: Date?
 
     public init(
@@ -143,6 +148,10 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
         intervalMinutes: Int = 15,
         isEnabled: Bool = true,
         syncOnLocalChanges: Bool = false,
+        uploadLocalChanges: Bool? = nil,
+        downloadRemoteChanges: Bool? = nil,
+        deleteRemoteWhenLocalDeleted: Bool? = nil,
+        deleteLocalWhenRemoteDeleted: Bool? = nil,
         lastSyncedAt: Date? = nil
     ) {
         self.id = id
@@ -153,7 +162,40 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
         self.intervalMinutes = max(1, intervalMinutes)
         self.isEnabled = isEnabled
         self.syncOnLocalChanges = syncOnLocalChanges
+        self.uploadLocalChanges = uploadLocalChanges
+        self.downloadRemoteChanges = downloadRemoteChanges
+        self.deleteRemoteWhenLocalDeleted = deleteRemoteWhenLocalDeleted
+        self.deleteLocalWhenRemoteDeleted = deleteLocalWhenRemoteDeleted
         self.lastSyncedAt = lastSyncedAt
+    }
+
+    public var uploadsLocalChanges: Bool {
+        uploadLocalChanges ?? (direction != .downloadOnly)
+    }
+
+    public var downloadsRemoteChanges: Bool {
+        downloadRemoteChanges ?? (direction != .uploadOnly)
+    }
+
+    public var propagatesLocalDeletes: Bool {
+        deleteRemoteWhenLocalDeleted ?? false
+    }
+
+    public var propagatesRemoteDeletes: Bool {
+        deleteLocalWhenRemoteDeleted ?? false
+    }
+
+    public var conflictDirection: SyncDirection {
+        switch (uploadsLocalChanges, downloadsRemoteChanges) {
+        case (true, true): return .bidirectional
+        case (true, false): return .uploadOnly
+        case (false, true): return .downloadOnly
+        case (false, false): return .uploadOnly
+        }
+    }
+
+    public var observesLocalChanges: Bool {
+        uploadsLocalChanges || propagatesLocalDeletes
     }
 }
 

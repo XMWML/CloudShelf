@@ -3,6 +3,8 @@ import Foundation
 public struct SyncReport: Sendable {
     public var uploaded = 0
     public var downloaded = 0
+    public var deletedRemote = 0
+    public var deletedLocal = 0
     public var skipped = 0
     public var conflicts = 0
 
@@ -10,7 +12,17 @@ public struct SyncReport: Sendable {
 }
 
 public actor SyncEngine {
-    public init() {}
+    private let stateStore: SyncStateStore
+
+    public init(stateDirectory: URL? = nil) {
+        let defaultDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CloudShelf/SyncState", isDirectory: true)
+        stateStore = SyncStateStore(directory: stateDirectory ?? defaultDirectory)
+    }
+
+    public func removeState(for ruleID: UUID) async {
+        await stateStore.remove(ruleID: ruleID)
+    }
 
     public func synchronize(rule: SyncRule, client: any RemoteClient) async throws -> SyncReport {
         let localRoot = URL(fileURLWithPath: rule.localFolder, isDirectory: true).resolvingSymlinksInPath()
@@ -20,14 +32,42 @@ public actor SyncEngine {
         }
 
         try await ensureRemoteRoot(rule.remoteFolder, client: client)
-        let localFiles = try localInventory(root: localRoot)
-        let remoteItems = try await remoteInventory(client: client, root: rule.remoteFolder)
+        var localItems = try localInventory(root: localRoot)
+        var remoteItems = try await remoteInventory(client: client, root: rule.remoteFolder)
         var knownRemoteDirectories = Set(remoteItems.values.filter(\.isDirectory).map(\.path))
         knownRemoteDirectories.insert(RemotePath.normalized(rule.remoteFolder))
         var report = SyncReport()
+        let previousState = await stateStore.load(ruleID: rule.id)
 
-        if rule.direction != .downloadOnly {
-            for (relativePath, local) in localFiles {
+        if rule.propagatesRemoteDeletes, let previousState {
+            let remotePaths = Set(relativeRemoteItems(remoteItems, root: rule.remoteFolder).keys)
+            let removedPaths = Set(previousState.remotePaths.filter {
+                !remotePaths.contains($0) && localItems[$0] != nil
+            })
+            for relativePath in deletionRoots(removedPaths) {
+                guard let local = localItems[relativePath] else { continue }
+                try FileManager.default.removeItem(at: local.url)
+                removeLocalItems(at: relativePath, from: &localItems)
+                report.deletedLocal += 1
+            }
+        }
+
+        if rule.propagatesLocalDeletes, let previousState {
+            var remoteByRelativePath = relativeRemoteItems(remoteItems, root: rule.remoteFolder)
+            let removedPaths = Set(previousState.localPaths.filter {
+                !localItems.keys.contains($0) && remoteByRelativePath[$0] != nil
+            })
+            for relativePath in deletionRoots(removedPaths) {
+                guard let remote = remoteByRelativePath[relativePath] else { continue }
+                try await client.delete(remote)
+                removeRemoteItems(at: relativePath, from: &remoteByRelativePath)
+                report.deletedRemote += 1
+            }
+            remoteItems = Dictionary(uniqueKeysWithValues: remoteByRelativePath.values.map { ($0.path, $0) })
+        }
+
+        if rule.uploadsLocalChanges {
+            for (relativePath, local) in localItems {
                 guard !local.isDirectory else { continue }
                 let remotePath = RemotePath.join(rule.remoteFolder, relativePath)
                 let remote = remoteItems[remotePath]
@@ -46,12 +86,12 @@ public actor SyncEngine {
             }
         }
 
-        if rule.direction != .uploadOnly {
+        if rule.downloadsRemoteChanges {
             for (_, remote) in remoteItems where !remote.isDirectory {
                 let relativePath = relativePath(for: remote.path, root: rule.remoteFolder)
                 guard !relativePath.isEmpty else { continue }
                 let localURL = localRoot.appending(path: relativePath)
-                let local = localFiles[relativePath]
+                let local = localItems[relativePath]
                 if shouldDownload(remote: remote, local: local, rule: rule) {
                     try await client.download(remote, to: localURL)
                     report.downloaded += 1
@@ -60,6 +100,14 @@ public actor SyncEngine {
                 }
             }
         }
+
+        let finalLocalItems = try localInventory(root: localRoot)
+        let finalRemoteItems = try await remoteInventory(client: client, root: rule.remoteFolder)
+        let finalRemotePaths = Set(relativeRemoteItems(finalRemoteItems, root: rule.remoteFolder).keys)
+        try await stateStore.save(
+            SyncState(localPaths: Set(finalLocalItems.keys), remotePaths: finalRemotePaths),
+            ruleID: rule.id
+        )
         return report
     }
 
@@ -72,7 +120,7 @@ public actor SyncEngine {
 
     private func localInventory(root: URL) throws -> [String: LocalItem] {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]) else { return [:] }
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: []) else { return [:] }
         var output: [String: LocalItem] = [:]
         for case let url as URL in enumerator {
             let resolvedURL = url.resolvingSymlinksInPath()
@@ -149,9 +197,32 @@ public actor SyncEngine {
         return String(normalizedPath.dropFirst(normalizedRoot.count + 1))
     }
 
+    private func relativeRemoteItems(_ items: [String: RemoteItem], root: String) -> [String: RemoteItem] {
+        Dictionary(uniqueKeysWithValues: items.values.compactMap { item in
+            let relative = relativePath(for: item.path, root: root)
+            return relative.isEmpty ? nil : (relative, item)
+        })
+    }
+
+    private func deletionRoots(_ paths: Set<String>) -> [String] {
+        paths.sorted { $0.split(separator: "/").count < $1.split(separator: "/").count }.filter { path in
+            !paths.contains { candidate in candidate != path && path.hasPrefix(candidate + "/") }
+        }
+    }
+
+    private func removeLocalItems(at relativePath: String, from items: inout [String: LocalItem]) {
+        let prefix = relativePath + "/"
+        items = items.filter { $0.key != relativePath && !$0.key.hasPrefix(prefix) }
+    }
+
+    private func removeRemoteItems(at relativePath: String, from items: inout [String: RemoteItem]) {
+        let prefix = relativePath + "/"
+        items = items.filter { $0.key != relativePath && !$0.key.hasPrefix(prefix) }
+    }
+
     private func shouldUpload(local: LocalItem, remote: RemoteItem?, rule: SyncRule) -> Bool {
         guard let remote else { return true }
-        switch rule.direction {
+        switch rule.conflictDirection {
         case .uploadOnly:
             guard local.size == remote.size else { return true }
             if let localDate = local.modifiedAt, let remoteDate = remote.modifiedAt { return localDate != remoteDate }
@@ -169,7 +240,7 @@ public actor SyncEngine {
 
     private func shouldDownload(remote: RemoteItem, local: LocalItem?, rule: SyncRule) -> Bool {
         guard let local else { return true }
-        switch rule.direction {
+        switch rule.conflictDirection {
         case .downloadOnly:
             guard remote.size == local.size else { return true }
             if let remoteDate = remote.modifiedAt, let localDate = local.modifiedAt { return remoteDate != localDate }

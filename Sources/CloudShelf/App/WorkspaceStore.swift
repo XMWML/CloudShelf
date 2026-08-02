@@ -238,10 +238,20 @@ final class WorkspaceStore: ObservableObject {
 
     func replaceSyncRules(_ rules: [SyncRule], for profileID: UUID) async {
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
-        let previousRuleIDs = Set(profiles[index].syncRules.map(\.id))
+        let previousRules = profiles[index].syncRules
+        let previousRuleIDs = Set(previousRules.map(\.id))
         let updatedRuleIDs = Set(rules.map(\.id))
         profiles[index].syncRules = rules
-        for ruleID in previousRuleIDs.subtracting(updatedRuleIDs) { clearChangeTracking(for: ruleID) }
+        for ruleID in previousRuleIDs.subtracting(updatedRuleIDs) {
+            clearChangeTracking(for: ruleID)
+            await syncEngine.removeState(for: ruleID)
+        }
+        for rule in rules {
+            guard let previous = previousRules.first(where: { $0.id == rule.id }),
+                  previous.localFolder != rule.localFolder || previous.remoteFolder != rule.remoteFolder else { continue }
+            clearChangeTracking(for: rule.id)
+            await syncEngine.removeState(for: rule.id)
+        }
         do {
             try await profileStore.save(profiles)
         } catch {
@@ -253,7 +263,10 @@ final class WorkspaceStore: ObservableObject {
         sessions.removeValue(forKey: profile.id)
         profiles.removeAll { $0.id == profile.id }
         CredentialStore.delete(profileID: profile.id)
-        profile.syncRules.forEach { clearChangeTracking(for: $0.id) }
+        profile.syncRules.forEach { rule in
+            clearChangeTracking(for: rule.id)
+            Task { await syncEngine.removeState(for: rule.id) }
+        }
         do { try await profileStore.save(profiles) } catch { lastError = error.localizedDescription }
     }
 
@@ -324,7 +337,9 @@ final class WorkspaceStore: ObservableObject {
             updateTransfer(transfer.id, status: .running, detail: "正在比较文件夹", startedAt: .now)
             do {
                 let report = try await syncEngine.synchronize(rule: rule, client: session.client)
-                updateTransfer(transfer.id, status: .succeeded, detail: "已上传 \(report.uploaded) 项，已下载 \(report.downloaded) 项", finishedAt: .now)
+                let deletions = report.deletedRemote + report.deletedLocal
+                let deletionText = deletions == 0 ? "" : "，已删除远端 \(report.deletedRemote) 项、本地 \(report.deletedLocal) 项"
+                updateTransfer(transfer.id, status: .succeeded, detail: "已上传 \(report.uploaded) 项，已下载 \(report.downloaded) 项\(deletionText)", finishedAt: .now)
                 markSynced(ruleID: rule.id, profileID: profile.id)
                 clearChangeTracking(for: rule.id)
             } catch {
@@ -567,7 +582,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func detectLocalFolderChanges() {
         for profile in profiles where sessions[profile.id] != nil {
-            for rule in profile.syncRules where rule.isEnabled && rule.syncOnLocalChanges == true && rule.direction != .downloadOnly {
+            for rule in profile.syncRules where rule.isEnabled && rule.syncOnLocalChanges == true && rule.observesLocalChanges {
                 guard fingerprintingRuleIDs.insert(rule.id).inserted else { continue }
                 Task { [weak self] in
                     let fingerprint = try? await Task.detached(priority: .utility) {
