@@ -5,3 +5,4 @@ dist/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 Resources/Local/
+work/

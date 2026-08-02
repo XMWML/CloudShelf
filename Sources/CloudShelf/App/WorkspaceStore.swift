@@ -188,18 +188,18 @@ final class WorkspaceStore: ObservableObject {
 
     func sync(profile: ConnectionProfile, rule: SyncRule) {
         guard let session = sessions[profile.id] else {
-            lastError = "Connect \(profile.name) before running its sync rules."
+            lastError = "请先连接 \(profile.name)，再执行同步规则。"
             return
         }
         guard syncingRuleIDs.insert(rule.id).inserted else { return }
-        let transfer = TransferTask(direction: .sync, title: "Sync \(URL(fileURLWithPath: rule.localFolder).lastPathComponent)", connectionName: profile.name)
+        let transfer = TransferTask(direction: .sync, title: "同步 \(URL(fileURLWithPath: rule.localFolder).lastPathComponent)", connectionName: profile.name)
         transfers.append(transfer)
         Task {
             defer { syncingRuleIDs.remove(rule.id) }
-            updateTransfer(transfer.id, status: .running, detail: "Comparing folders", startedAt: .now)
+            updateTransfer(transfer.id, status: .running, detail: "正在比较文件夹", startedAt: .now)
             do {
                 let report = try await syncEngine.synchronize(rule: rule, client: session.client)
-                updateTransfer(transfer.id, status: .succeeded, detail: "\(report.uploaded) uploaded, \(report.downloaded) downloaded", finishedAt: .now)
+                updateTransfer(transfer.id, status: .succeeded, detail: "已上传 \(report.uploaded) 项，已下载 \(report.downloaded) 项", finishedAt: .now)
                 markSynced(ruleID: rule.id, profileID: profile.id)
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
@@ -213,10 +213,10 @@ final class WorkspaceStore: ObservableObject {
         let transfer = TransferTask(direction: .upload, title: url.lastPathComponent, connectionName: session.profile.name)
         transfers.append(transfer)
         Task {
-            updateTransfer(transfer.id, status: .running, detail: "Uploading", startedAt: .now)
+            updateTransfer(transfer.id, status: .running, detail: "正在上传", startedAt: .now)
             do {
                 try await session.client.upload(url, to: session.location)
-                updateTransfer(transfer.id, status: .succeeded, detail: "Uploaded", finishedAt: .now)
+                updateTransfer(transfer.id, status: .succeeded, detail: "上传完成", finishedAt: .now)
                 await session.reload()
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
@@ -229,10 +229,10 @@ final class WorkspaceStore: ObservableObject {
         let transfer = TransferTask(direction: .download, title: item.name, connectionName: session.profile.name)
         transfers.append(transfer)
         Task {
-            updateTransfer(transfer.id, status: .running, detail: "Downloading", startedAt: .now)
+            updateTransfer(transfer.id, status: .running, detail: "正在下载", startedAt: .now)
             do {
                 try await session.client.download(item, to: directory.appendingPathComponent(item.name))
-                updateTransfer(transfer.id, status: .succeeded, detail: "Downloaded", finishedAt: .now)
+                updateTransfer(transfer.id, status: .succeeded, detail: "下载完成", finishedAt: .now)
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
                 lastError = error.localizedDescription
@@ -241,13 +241,13 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func enqueueCopy(_ item: RemoteItem, destination: String, session: RemoteSession) {
-        let transfer = TransferTask(direction: .sync, title: "Copy \(item.name)", connectionName: session.profile.name)
+        let transfer = TransferTask(direction: .sync, title: "复制 \(item.name)", connectionName: session.profile.name)
         transfers.append(transfer)
         Task {
-            updateTransfer(transfer.id, status: .running, detail: "Copying", startedAt: .now)
+            updateTransfer(transfer.id, status: .running, detail: "正在复制", startedAt: .now)
             do {
                 try await session.client.copy(item, to: destination)
-                updateTransfer(transfer.id, status: .succeeded, detail: "Copied", finishedAt: .now)
+                updateTransfer(transfer.id, status: .succeeded, detail: "复制完成", finishedAt: .now)
                 await session.reload()
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
@@ -257,13 +257,13 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func enqueueMove(_ item: RemoteItem, destination: String, session: RemoteSession) {
-        let transfer = TransferTask(direction: .sync, title: "Move \(item.name)", connectionName: session.profile.name)
+        let transfer = TransferTask(direction: .sync, title: "移动 \(item.name)", connectionName: session.profile.name)
         transfers.append(transfer)
         Task {
-            updateTransfer(transfer.id, status: .running, detail: "Moving", startedAt: .now)
+            updateTransfer(transfer.id, status: .running, detail: "正在移动", startedAt: .now)
             do {
                 try await session.client.move(item, to: destination)
-                updateTransfer(transfer.id, status: .succeeded, detail: "Moved", finishedAt: .now)
+                updateTransfer(transfer.id, status: .succeeded, detail: "移动完成", finishedAt: .now)
                 await session.reload()
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)

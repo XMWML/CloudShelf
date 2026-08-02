@@ -16,6 +16,11 @@ final class CloudShelfApplication: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 
+private enum RemoteClipboardOperation {
+    case copy
+    case move
+}
+
 @MainActor
 final class FileManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSToolbarDelegate {
     fileprivate let store = WorkspaceStore()
@@ -23,10 +28,15 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     fileprivate let browserTable = NSTableView()
     fileprivate let transferTable = NSTableView()
     fileprivate let pathLabel = NSTextField(labelWithString: "/")
-    fileprivate let connectionStatus = NSTextField(labelWithString: "No connection selected")
+    fileprivate let connectionStatus = NSTextField(labelWithString: "未选择连接")
     private var selectedProfileID: UUID?
     private var session: RemoteSession?
     private var refreshTimer: Timer?
+    private var clipboardItems: [RemoteItem] = []
+    private var clipboardProfileID: UUID?
+    private var clipboardOperation: RemoteClipboardOperation = .copy
+    private var presentingError = false
+    private var lastSessionError: String?
 
     init() {
         let window = NSWindow(
@@ -69,7 +79,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             case "name": text = item.name
             case "modified": text = item.modifiedAt?.formatted(date: .abbreviated, time: .shortened) ?? "-"
             case "size": text = item.isDirectory ? "-" : item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "-"
-            case "type": text = item.isDirectory ? "Folder" : (item.fileExtension.isEmpty ? "File" : item.fileExtension.uppercased())
+            case "type": text = item.isDirectory ? "文件夹" : (item.fileExtension.isEmpty ? "文件" : item.fileExtension.uppercased())
             default: text = ""
             }
             icon = identifier == "name" ? symbol(item.isDirectory ? "folder.fill" : "doc") : nil
@@ -127,15 +137,16 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         transferTable.reloadData()
         pathLabel.stringValue = session?.location ?? "/"
         if let session {
-            connectionStatus.stringValue = "\(session.profile.name)  |  \(session.profile.protocolType.rawValue)  |  \(session.isLoading ? "Loading..." : "Connected")"
+            connectionStatus.stringValue = "\(session.profile.name)  |  \(session.profile.protocolType.rawValue)  |  \(session.isLoading ? "正在加载" : "已连接")"
         } else {
-            connectionStatus.stringValue = "No connection selected"
+            connectionStatus.stringValue = "未选择连接"
         }
+        showErrorIfNeeded()
     }
 
     func addConnection() {
         let form = ConnectionForm()
-        presentForm(title: "New Connection", form: form, actionTitle: "Save") { [weak self] in
+        presentForm(title: "新建连接", form: form, actionTitle: "保存") { [weak self] in
             guard let self, let profile = form.profile() else { return }
             Task {
                 await self.store.save(profile: profile, secret: form.secret)
@@ -150,7 +161,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func editConnection() {
         guard let profile = selectedProfile else { return }
         let form = ConnectionForm(profile: profile)
-        presentForm(title: "Edit Connection", form: form, actionTitle: "Save") { [weak self] in
+        presentForm(title: "编辑连接", form: form, actionTitle: "保存") { [weak self] in
             guard let self, let changed = form.profile(existing: profile) else { return }
             Task {
                 self.store.unmount(profile)
@@ -165,10 +176,10 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc func removeConnection() {
         guard let profile = selectedProfile else { return }
         let alert = NSAlert()
-        alert.messageText = "Delete \(profile.name)?"
-        alert.informativeText = "This removes the saved connection and its Keychain credential. Remote files are not changed."
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
+        alert.messageText = "移除 \(profile.name)？"
+        alert.informativeText = "这会删除保存的连接和钥匙串凭据，不会改动远端文件。"
+        alert.addButton(withTitle: "移除")
+        alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window!) { [weak self] response in
             guard response == .alertFirstButtonReturn, let self else { return }
             Task {
@@ -209,7 +220,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func newFolder() {
         guard let session else { return }
-        prompt(title: "New Folder", message: "Create a folder in \(session.location)", placeholder: "Folder name") { [weak self] name in
+        prompt(title: "新建文件夹", message: "在 \(session.location) 中创建文件夹", placeholder: "文件夹名称") { [weak self] name in
             guard let self else { return }
             Task { await self.store.createFolder(name, in: session); self.refreshViews() }
         }
@@ -217,7 +228,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func rename() {
         guard let item = selectedItems.first, selectedItems.count == 1, let session else { return }
-        prompt(title: "Rename", message: item.name, placeholder: "New name", value: item.name) { [weak self] name in
+        prompt(title: "重命名", message: item.name, placeholder: "新名称", value: item.name) { [weak self] name in
             guard let self else { return }
             Task { await self.store.rename(item, to: name, in: session); self.refreshViews() }
         }
@@ -227,10 +238,10 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         let items = selectedItems
         guard !items.isEmpty, let session else { return }
         let alert = NSAlert()
-        alert.messageText = "Delete \(items.count) selected item\(items.count == 1 ? "" : "s")?"
-        alert.informativeText = "Deletion is applied to the remote server immediately."
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
+        alert.messageText = "删除已选择的 \(items.count) 项？"
+        alert.informativeText = "删除会立即作用于远端服务器。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window!) { [weak self] response in
             guard response == .alertFirstButtonReturn, let self else { return }
             Task { await self.store.delete(items, in: session); self.refreshViews() }
@@ -243,7 +254,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
-        panel.prompt = "Upload"
+        panel.prompt = "上传"
         panel.beginSheetModal(for: window!) { [weak self] response in
             guard response == .OK, let self else { return }
             self.store.upload(panel.urls, to: session)
@@ -258,7 +269,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Download Here"
+        panel.prompt = "下载到此处"
         panel.beginSheetModal(for: window!) { [weak self] response in
             guard response == .OK, let destination = panel.url, let self else { return }
             self.store.download(items, to: destination, from: session)
@@ -274,11 +285,11 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.prompt = "Choose Local Folder"
+        panel.prompt = "选择本地文件夹"
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let local = panel.url?.path, let self else { return }
             let form = SyncForm(localFolder: local)
-            self.presentForm(title: "Automatic Sync", form: form, actionTitle: "Add Rule") {
+            self.presentForm(title: "自动同步", form: form, actionTitle: "添加规则") {
                 var changed = profile
                 changed.syncRules.append(form.rule())
                 Task { await self.store.save(profile: changed, secret: nil); self.refreshViews() }
@@ -297,7 +308,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private func moveOrCopy(isMove: Bool) {
         let items = selectedItems
         guard !items.isEmpty, let session else { return }
-        prompt(title: isMove ? "Move to Folder" : "Copy to Folder", message: "Enter a remote destination folder.", placeholder: "/destination", value: session.location) { [weak self] destination in
+        prompt(title: isMove ? "移动到文件夹" : "复制到文件夹", message: "输入远端目标文件夹。", placeholder: "/目标文件夹", value: session.location) { [weak self] destination in
             guard let self else { return }
             if isMove { self.store.move(items, to: RemotePath.normalized(destination), from: session) }
             else { self.store.copy(items, to: RemotePath.normalized(destination), from: session) }
@@ -314,6 +325,90 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             guard index >= 0, index < session.items.count else { return nil }
             return session.items[index]
         }
+    }
+
+    private func showErrorIfNeeded() {
+        if let message = store.lastError, !presentingError {
+            // A failed initial connection is recorded on both the session and store.
+            // Mark it handled here so the same failure is not presented twice.
+            if message == session?.errorMessage { lastSessionError = message }
+            presentError(message) { [weak self] in self?.store.lastError = nil }
+            return
+        }
+        guard let message = session?.errorMessage else {
+            lastSessionError = nil
+            return
+        }
+        guard message != lastSessionError, !presentingError else { return }
+        lastSessionError = message
+        presentError(message)
+    }
+
+    private func presentError(_ message: String, completion: (() -> Void)? = nil) {
+        guard let window else { return }
+        presentingError = true
+        let alert = NSAlert()
+        alert.messageText = "操作失败"
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.beginSheetModal(for: window) { [weak self] _ in
+            self?.presentingError = false
+            completion?()
+        }
+    }
+
+    private func isEditingText() -> Bool { window?.firstResponder is NSTextView }
+
+    func copySelection() {
+        if isEditingText() { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self); return }
+        guard let session, !selectedItems.isEmpty else {
+            store.lastError = "请选择要复制的远端文件。"
+            return
+        }
+        clipboardItems = selectedItems
+        clipboardProfileID = session.profile.id
+        clipboardOperation = .copy
+        connectionStatus.stringValue = "已复制 \(clipboardItems.count) 项，可在目标文件夹粘贴。"
+    }
+
+    func cutSelection() {
+        if isEditingText() { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self); return }
+        guard let session, !selectedItems.isEmpty else {
+            store.lastError = "请选择要剪切的远端文件。"
+            return
+        }
+        clipboardItems = selectedItems
+        clipboardProfileID = session.profile.id
+        clipboardOperation = .move
+        connectionStatus.stringValue = "已剪切 \(clipboardItems.count) 项，可在目标文件夹粘贴。"
+    }
+
+    func pasteSelection() {
+        if isEditingText() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self); return }
+        guard let session else {
+            store.lastError = "请先连接并打开一个远端文件夹。"
+            return
+        }
+        guard !clipboardItems.isEmpty else {
+            store.lastError = "远端剪贴板为空。"
+            return
+        }
+        guard clipboardProfileID == session.profile.id else {
+            store.lastError = "暂不支持在不同服务器之间直接粘贴，请先下载再上传。"
+            return
+        }
+        switch clipboardOperation {
+        case .copy: store.copy(clipboardItems, to: session.location, from: session)
+        case .move:
+            store.move(clipboardItems, to: session.location, from: session)
+            clipboardItems = []
+            clipboardProfileID = nil
+        }
+    }
+
+    func selectAll() {
+        if isEditingText() { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: self); return }
+        browserTable.selectAll(nil)
     }
 
     private func configureToolbar() {
@@ -335,14 +430,21 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             .separator(),
             menuItem("删除连接", #selector(removeConnection), key: "", modifiers: [])
         ]))
+        main.addItem(menu(title: "编辑", items: [
+            menuItem("剪切", #selector(cutSelectionAction), key: "x"),
+            menuItem("复制", #selector(copySelectionAction), key: "c"),
+            menuItem("粘贴", #selector(pasteSelectionAction), key: "v"),
+            .separator(),
+            menuItem("全选", #selector(selectAllAction), key: "a")
+        ]))
         main.addItem(menu(title: "文件", items: [
             menuItem("新建文件夹", #selector(folderAction), key: "n", modifiers: [.command, .shift]),
             menuItem("上传", #selector(uploadAction), key: "u"),
             menuItem("下载", #selector(downloadAction), key: "d"),
             .separator(),
             menuItem("重命名", #selector(renameAction)),
-            menuItem("复制到文件夹", #selector(copyAction)),
-            menuItem("移动到文件夹", #selector(moveAction)),
+            menuItem("复制到指定文件夹", #selector(copyAction)),
+            menuItem("移动到指定文件夹", #selector(moveAction)),
             menuItem("删除", #selector(deleteAction), key: "\u{8}")
         ]))
         main.addItem(menu(title: "视图", items: [
@@ -407,17 +509,17 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         let item = NSToolbarItem(itemIdentifier: itemIdentifier)
         switch itemIdentifier.rawValue {
-        case "add": item.label = "Connection"; item.toolTip = "New connection"; item.image = symbol("plus"); item.target = self; item.action = #selector(addAction)
-        case "edit": item.label = "Edit"; item.toolTip = "Edit selected connection"; item.image = symbol("slider.horizontal.3"); item.target = self; item.action = #selector(editAction)
-        case "up": item.label = "Up"; item.toolTip = "Parent folder"; item.image = symbol("arrow.up"); item.target = self; item.action = #selector(upAction)
-        case "reload": item.label = "Reload"; item.toolTip = "Reload folder"; item.image = symbol("arrow.clockwise"); item.target = self; item.action = #selector(reloadAction)
-        case "folder": item.label = "Folder"; item.toolTip = "New folder"; item.image = symbol("folder.badge.plus"); item.target = self; item.action = #selector(folderAction)
-        case "upload": item.label = "Upload"; item.toolTip = "Upload files"; item.image = symbol("arrow.up.doc"); item.target = self; item.action = #selector(uploadAction)
-        case "download": item.label = "Download"; item.toolTip = "Download selected files"; item.image = symbol("arrow.down.doc"); item.target = self; item.action = #selector(downloadAction)
-        case "copy": item.label = "Copy"; item.toolTip = "Copy selected files"; item.image = symbol("doc.on.doc"); item.target = self; item.action = #selector(copyAction)
-        case "move": item.label = "Move"; item.toolTip = "Move selected files"; item.image = symbol("folder.badge.gearshape"); item.target = self; item.action = #selector(moveAction)
-        case "delete": item.label = "Delete"; item.toolTip = "Delete selected files"; item.image = symbol("trash"); item.target = self; item.action = #selector(deleteAction)
-        case "sync": item.label = "Sync"; item.toolTip = "Configure or run automatic sync"; item.image = symbol("arrow.triangle.2.circlepath"); item.target = self; item.action = #selector(syncAction)
+        case "add": item.label = "新建连接"; item.toolTip = "新建连接"; item.image = symbol("plus"); item.target = self; item.action = #selector(addAction)
+        case "edit": item.label = "编辑"; item.toolTip = "编辑所选连接"; item.image = symbol("slider.horizontal.3"); item.target = self; item.action = #selector(editAction)
+        case "up": item.label = "上级"; item.toolTip = "返回上级目录"; item.image = symbol("arrow.up"); item.target = self; item.action = #selector(upAction)
+        case "reload": item.label = "刷新"; item.toolTip = "刷新当前目录"; item.image = symbol("arrow.clockwise"); item.target = self; item.action = #selector(reloadAction)
+        case "folder": item.label = "新建文件夹"; item.toolTip = "新建文件夹"; item.image = symbol("folder.badge.plus"); item.target = self; item.action = #selector(folderAction)
+        case "upload": item.label = "上传"; item.toolTip = "上传文件"; item.image = symbol("arrow.up.doc"); item.target = self; item.action = #selector(uploadAction)
+        case "download": item.label = "下载"; item.toolTip = "下载所选文件"; item.image = symbol("arrow.down.doc"); item.target = self; item.action = #selector(downloadAction)
+        case "copy": item.label = "复制"; item.toolTip = "复制到指定文件夹"; item.image = symbol("doc.on.doc"); item.target = self; item.action = #selector(copyAction)
+        case "move": item.label = "移动"; item.toolTip = "移动到指定文件夹"; item.image = symbol("folder.badge.gearshape"); item.target = self; item.action = #selector(moveAction)
+        case "delete": item.label = "删除"; item.toolTip = "删除所选文件"; item.image = symbol("trash"); item.target = self; item.action = #selector(deleteAction)
+        case "sync": item.label = "同步"; item.toolTip = "配置或执行自动同步"; item.image = symbol("arrow.triangle.2.circlepath"); item.target = self; item.action = #selector(syncAction)
         default: return nil
         }
         return item
@@ -433,6 +535,10 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc fileprivate func uploadAction() { chooseUploads() }
     @objc fileprivate func downloadAction() { chooseDownloads() }
     @objc fileprivate func renameAction() { rename() }
+    @objc fileprivate func cutSelectionAction() { cutSelection() }
+    @objc fileprivate func copySelectionAction() { copySelection() }
+    @objc fileprivate func pasteSelectionAction() { pasteSelection() }
+    @objc fileprivate func selectAllAction() { selectAll() }
     @objc fileprivate func copyAction() { copyItems() }
     @objc fileprivate func moveAction() { moveItems() }
     @objc fileprivate func deleteAction() { deleteItems() }
@@ -443,7 +549,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc private func showAbout() {
         let alert = NSAlert()
         alert.messageText = "CloudShelf"
-        alert.informativeText = "FTP、SFTP、WebDAV 应用内文件工作区\n不使用 Finder 挂载 API 或 macFUSE。"
+        alert.informativeText = "远程文件工作区。"
         alert.runModal()
     }
 
@@ -459,7 +565,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         alert.messageText = title
         alert.accessoryView = form
         alert.addButton(withTitle: actionTitle)
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window!) { response in if response == .alertFirstButtonReturn { completion() } }
     }
 
@@ -471,8 +577,8 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         alert.messageText = title
         alert.informativeText = message
         alert.accessoryView = input
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "继续")
+        alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window!) { response in
             let value = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if response == .alertFirstButtonReturn, !value.isEmpty { completion(value) }
@@ -552,7 +658,7 @@ private final class FileManagerViewController: NSViewController {
 
     private func makeSidebar() -> NSView {
         let container = NSView()
-        let title = NSTextField(labelWithString: "CONNECTIONS")
+        let title = NSTextField(labelWithString: "连接")
         title.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         title.textColor = .secondaryLabelColor
         let scroll = scrollView(for: owner.connectionTable)
@@ -560,11 +666,11 @@ private final class FileManagerViewController: NSViewController {
         owner.connectionTable.dataSource = owner
         owner.connectionTable.headerView = nil
         owner.connectionTable.rowHeight = 38
-        owner.connectionTable.addTableColumn(column("connection", title: "Connection", width: 175))
-        owner.connectionTable.addTableColumn(column("protocol", title: "Protocol", width: 70))
-        let button = NSButton(title: "New Connection", target: owner, action: #selector(FileManagerWindowController.addAction))
+        owner.connectionTable.addTableColumn(column("connection", title: "名称", width: 175))
+        owner.connectionTable.addTableColumn(column("protocol", title: "协议", width: 70))
+        let button = NSButton(title: "新建连接", target: owner, action: #selector(FileManagerWindowController.addAction))
         button.bezelStyle = .rounded
-        let remove = NSButton(title: "Remove", target: owner, action: #selector(FileManagerWindowController.removeConnection))
+        let remove = NSButton(title: "移除", target: owner, action: #selector(FileManagerWindowController.removeConnection))
         remove.bezelStyle = .rounded
         let row = NSStackView(views: [button, remove])
         row.orientation = .horizontal
@@ -600,11 +706,11 @@ private final class FileManagerViewController: NSViewController {
         owner.browserTable.target = owner
         owner.browserTable.doubleAction = #selector(FileManagerWindowController.openSelectedItem)
         owner.browserTable.registerForDraggedTypes([.fileURL])
-        owner.browserTable.addTableColumn(column("name", title: "Name", width: 380))
-        owner.browserTable.addTableColumn(column("modified", title: "Modified", width: 160))
-        owner.browserTable.addTableColumn(column("size", title: "Size", width: 95))
-        owner.browserTable.addTableColumn(column("type", title: "Type", width: 110))
-        let transferTitle = NSTextField(labelWithString: "TRANSFERS")
+        owner.browserTable.addTableColumn(column("name", title: "名称", width: 380))
+        owner.browserTable.addTableColumn(column("modified", title: "修改时间", width: 160))
+        owner.browserTable.addTableColumn(column("size", title: "大小", width: 95))
+        owner.browserTable.addTableColumn(column("type", title: "类型", width: 110))
+        let transferTitle = NSTextField(labelWithString: "传输")
         transferTitle.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         transferTitle.textColor = .secondaryLabelColor
         let transferScroll = scrollView(for: owner.transferTable)
@@ -612,8 +718,8 @@ private final class FileManagerViewController: NSViewController {
         owner.transferTable.dataSource = owner
         owner.transferTable.headerView = nil
         owner.transferTable.rowHeight = 27
-        owner.transferTable.addTableColumn(column("transfer", title: "Transfer", width: 245))
-        owner.transferTable.addTableColumn(column("state", title: "State", width: 430))
+        owner.transferTable.addTableColumn(column("transfer", title: "任务", width: 245))
+        owner.transferTable.addTableColumn(column("state", title: "状态", width: 430))
         let stack = NSStackView(views: [top, browserScroll, transferTitle, transferScroll])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -658,7 +764,9 @@ private final class ConnectionForm: NSView {
     private let secretField = NSSecureTextField(string: "")
     private let keyPath = NSTextField(string: "")
     private let hostKeyPolicy = NSPopUpButton()
-    private let tls = NSButton(checkboxWithTitle: "Use TLS", target: nil, action: nil)
+    private let tls = NSButton(checkboxWithTitle: "使用 TLS", target: nil, action: nil)
+    private let authenticationTitles = ["密码", "SSH Agent", "私钥"]
+    private let hostKeyTitles = ["严格校验", "首次接受新密钥"]
 
     var secret: String? {
         let value = secretField.stringValue
@@ -668,12 +776,18 @@ private final class ConnectionForm: NSView {
     init(profile: ConnectionProfile? = nil) {
         super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 364))
         protocolBox.addItems(withTitles: RemoteProtocol.allCases.map(\.rawValue))
-        authentication.addItems(withTitles: AuthenticationMethod.allCases.map(\.rawValue))
-        hostKeyPolicy.addItems(withTitles: HostKeyPolicy.allCases.map(\.rawValue))
+        protocolBox.target = self
+        protocolBox.action = #selector(protocolChanged)
+        authentication.addItems(withTitles: authenticationTitles)
+        hostKeyPolicy.addItems(withTitles: hostKeyTitles)
+        host.placeholderString = "files.example.com 或 http://[IPv6]:5244/dav"
+        host.toolTip = "WebDAV 可直接填写完整 http:// 或 https:// 地址，端口和路径会自动解析。"
+        root.toolTip = "完整 WebDAV URL 已包含 /dav 等路径时，保持 / 即可。"
+        tls.title = "使用 TLS"
         layout(rows: [
-            ("Name", name), ("Protocol", protocolBox), ("Host", host), ("Port", port),
-            ("Username", username), ("Remote root", root), ("Authentication", authentication),
-            ("Password", secretField), ("Private key", keyPath), ("Host key", hostKeyPolicy), ("", tls)
+            ("名称", name), ("协议", protocolBox), ("服务器 / WebDAV URL", host), ("端口", port),
+            ("用户名", username), ("远端根目录", root), ("认证方式", authentication),
+            ("密码", secretField), ("私钥路径", keyPath), ("主机密钥", hostKeyPolicy), ("", tls)
         ])
         if let profile {
             name.stringValue = profile.name
@@ -682,13 +796,13 @@ private final class ConnectionForm: NSView {
             port.stringValue = String(profile.port)
             username.stringValue = profile.username
             root.stringValue = profile.basePath
-            authentication.selectItem(withTitle: profile.authentication.rawValue)
+            authentication.selectItem(at: Self.authenticationIndex(profile.authentication))
             keyPath.stringValue = profile.privateKeyPath ?? ""
-            hostKeyPolicy.selectItem(withTitle: profile.hostKeyPolicy.rawValue)
+            hostKeyPolicy.selectItem(at: Self.hostKeyIndex(profile.hostKeyPolicy))
             tls.state = profile.useTLS ? .on : .off
         } else {
             protocolBox.selectItem(withTitle: RemoteProtocol.sftp.rawValue)
-            hostKeyPolicy.selectItem(withTitle: HostKeyPolicy.acceptNew.rawValue)
+            hostKeyPolicy.selectItem(at: Self.hostKeyIndex(.acceptNew))
             tls.state = .off
         }
     }
@@ -699,8 +813,8 @@ private final class ConnectionForm: NSView {
 
     func profile(existing: ConnectionProfile? = nil) -> ConnectionProfile? {
         guard let protocolType = RemoteProtocol(rawValue: protocolBox.titleOfSelectedItem ?? ""),
-              let method = AuthenticationMethod(rawValue: authentication.titleOfSelectedItem ?? ""),
-              let keyPolicy = HostKeyPolicy(rawValue: hostKeyPolicy.titleOfSelectedItem ?? ""),
+              let method = Self.authentication(at: authentication.indexOfSelectedItem),
+              let keyPolicy = Self.hostKeyPolicy(at: hostKeyPolicy.indexOfSelectedItem),
               let parsedPort = Int(port.stringValue), !name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !host.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return ConnectionProfile(
@@ -733,6 +847,44 @@ private final class ConnectionForm: NSView {
             grid.topAnchor.constraint(equalTo: topAnchor), grid.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
     }
+
+    @objc private func protocolChanged() {
+        guard let type = RemoteProtocol(rawValue: protocolBox.titleOfSelectedItem ?? "") else { return }
+        port.stringValue = String(type.defaultPort)
+        tls.state = type.defaultTLS ? .on : .off
+    }
+
+    private static func authenticationIndex(_ method: AuthenticationMethod) -> Int {
+        switch method {
+        case .password: return 0
+        case .sshAgent: return 1
+        case .privateKey: return 2
+        }
+    }
+
+    private static func authentication(at index: Int) -> AuthenticationMethod? {
+        switch index {
+        case 0: return .password
+        case 1: return .sshAgent
+        case 2: return .privateKey
+        default: return nil
+        }
+    }
+
+    private static func hostKeyIndex(_ policy: HostKeyPolicy) -> Int {
+        switch policy {
+        case .strict: return 0
+        case .acceptNew: return 1
+        }
+    }
+
+    private static func hostKeyPolicy(at index: Int) -> HostKeyPolicy? {
+        switch index {
+        case 0: return .strict
+        case 1: return .acceptNew
+        default: return nil
+        }
+    }
 }
 
 private final class SyncForm: NSView {
@@ -740,15 +892,16 @@ private final class SyncForm: NSView {
     private let remote = NSTextField(string: "/")
     private let direction = NSPopUpButton()
     private let interval = NSPopUpButton()
+    private let directionTitles = ["仅上传本地变更", "仅下载远端变更", "保留较新版本"]
 
     init(localFolder: String) {
         super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 132))
         local.stringValue = localFolder
         local.isEditable = false
-        direction.addItems(withTitles: SyncDirection.allCases.map(\.rawValue))
-        interval.addItems(withTitles: ["5 minutes", "15 minutes", "30 minutes", "1 hour"])
+        direction.addItems(withTitles: directionTitles)
+        interval.addItems(withTitles: ["5 分钟", "15 分钟", "30 分钟", "1 小时"])
         interval.selectItem(at: 1)
-        layout(rows: [("Local folder", local), ("Remote folder", remote), ("Direction", direction), ("Frequency", interval)])
+        layout(rows: [("本地文件夹", local), ("远端文件夹", remote), ("同步方向", direction), ("执行频率", interval)])
     }
 
     required init?(coder: NSCoder) { nil }
@@ -757,7 +910,13 @@ private final class SyncForm: NSView {
 
     func rule() -> SyncRule {
         let minutes = [5, 15, 30, 60][max(0, interval.indexOfSelectedItem)]
-        return SyncRule(localFolder: local.stringValue, remoteFolder: remote.stringValue, direction: SyncDirection(rawValue: direction.titleOfSelectedItem ?? "") ?? .uploadOnly, intervalMinutes: minutes)
+        let syncDirection: SyncDirection
+        switch direction.indexOfSelectedItem {
+        case 1: syncDirection = .downloadOnly
+        case 2: syncDirection = .bidirectional
+        default: syncDirection = .uploadOnly
+        }
+        return SyncRule(localFolder: local.stringValue, remoteFolder: remote.stringValue, direction: syncDirection, intervalMinutes: minutes)
     }
 
     private func layout(rows: [(String, NSView)]) {

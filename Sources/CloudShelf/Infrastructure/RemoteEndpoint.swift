@@ -5,10 +5,34 @@ struct RemoteEndpoint: Sendable {
 
     init(profile: ConnectionProfile) throws {
         let trimmedHost = profile.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedHost.isEmpty, !trimmedHost.contains("://"), !trimmedHost.contains("/") else {
-            throw CloudShelfError.invalidProfile("Enter a hostname only, without a scheme or path.")
+        guard !trimmedHost.isEmpty else {
+            throw CloudShelfError.invalidProfile("请填写服务器地址。")
         }
-        self.profile = profile
+
+        var resolved = profile
+        if profile.protocolType == .webDAV, trimmedHost.contains("://") {
+            guard let components = URLComponents(string: trimmedHost),
+                  let scheme = components.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = components.host, !host.isEmpty else {
+                throw CloudShelfError.invalidProfile("WebDAV 地址必须是完整的 http:// 或 https:// URL。")
+            }
+            guard components.query == nil, components.fragment == nil else {
+                throw CloudShelfError.invalidProfile("WebDAV 服务器地址不能包含查询参数或锚点。")
+            }
+            resolved.host = host
+            resolved.port = components.port ?? profile.port
+            resolved.useTLS = scheme == "https"
+            let urlPath = components.path.isEmpty ? "/" : components.path
+            resolved.basePath = profile.basePath == "/" ? RemotePath.normalized(urlPath) : RemotePath.join(urlPath, profile.basePath)
+            self.profile = resolved
+            return
+        }
+
+        guard !trimmedHost.contains("://"), !trimmedHost.contains("/") else {
+            throw CloudShelfError.invalidProfile("FTP 和 SFTP 请只填写主机名或 IP 地址；WebDAV 可填写完整 URL。")
+        }
+        self.profile = resolved
     }
 
     func serverPath(for path: String) -> String {
