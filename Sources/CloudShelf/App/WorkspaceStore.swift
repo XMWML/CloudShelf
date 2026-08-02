@@ -148,6 +148,58 @@ private struct FolderUploadPlan: Sendable {
     }
 }
 
+private struct FolderDownloadPlan: Sendable {
+    let root: RemoteItem
+    let directories: [RemoteItem]
+    let files: [RemoteItem]
+
+    var totalBytes: Int64? {
+        guard files.allSatisfy({ $0.size != nil }) else { return nil }
+        return files.reduce(0) { $0 + ($1.size ?? 0) }
+    }
+
+    static func make(root: RemoteItem, client: any RemoteClient) async throws -> FolderDownloadPlan {
+        var visited = Set<String>()
+        var directories: [RemoteItem] = []
+        var files: [RemoteItem] = []
+
+        func visit(_ directory: RemoteItem) async throws {
+            guard visited.insert(directory.path).inserted else { return }
+            directories.append(directory)
+            for item in try await client.list(at: directory.path) {
+                if item.isDirectory {
+                    try await visit(item)
+                } else {
+                    files.append(item)
+                }
+            }
+        }
+
+        try await visit(root)
+        directories.sort {
+            let leftDepth = $0.path.split(separator: "/").count
+            let rightDepth = $1.path.split(separator: "/").count
+            return leftDepth == rightDepth
+                ? $0.path.localizedStandardCompare($1.path) == .orderedAscending
+                : leftDepth < rightDepth
+        }
+        files.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        return FolderDownloadPlan(root: root, directories: directories, files: files)
+    }
+
+    func destinationURL(for item: RemoteItem, in destinationDirectory: URL) throws -> URL {
+        let rootPath = RemotePath.normalized(root.path)
+        let itemPath = RemotePath.normalized(item.path)
+        let localRoot = destinationDirectory.appendingPathComponent(root.name, isDirectory: true)
+        guard itemPath != rootPath else { return localRoot }
+        let prefix = rootPath + "/"
+        guard itemPath.hasPrefix(prefix) else {
+            throw CloudShelfError.invalidResponse("远端文件夹返回了范围外的项目。")
+        }
+        return localRoot.appending(path: String(itemPath.dropFirst(prefix.count)))
+    }
+}
+
 private struct LocalFolderFingerprint: Sendable, Equatable {
     let itemCount: Int
     let totalBytes: Int64
@@ -459,29 +511,89 @@ final class WorkspaceStore: ObservableObject {
             direction: .download,
             title: item.name,
             connectionName: session.profile.name,
-            totalBytes: item.size
+            totalBytes: item.isDirectory ? nil : item.size
         )
         transfers.append(transfer)
         Task {
-            updateTransfer(transfer.id, status: .running, detail: "正在下载", startedAt: .now)
             do {
-                try await session.client.download(
-                    item,
-                    to: directory.appendingPathComponent(item.name),
-                    progress: transferProgressHandler(for: transfer.id, totalBytes: item.size)
-                )
-                updateTransfer(
-                    transfer.id,
-                    status: .succeeded,
-                    detail: "下载完成",
-                    finishedAt: .now,
-                    completedBytes: item.size ?? 0
-                )
+                if item.isDirectory {
+                    updateTransfer(transfer.id, status: .running, detail: "正在读取远端文件夹", startedAt: .now)
+                    let plan = try await FolderDownloadPlan.make(root: item, client: session.client)
+                    if let totalBytes = plan.totalBytes { setTransferTotal(transfer.id, bytes: totalBytes) }
+                    let completedBytes = try await download(folder: plan, to: directory, client: session.client, transferID: transfer.id)
+                    updateTransfer(
+                        transfer.id,
+                        status: .succeeded,
+                        detail: "已下载 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹",
+                        finishedAt: .now,
+                        completedBytes: completedBytes
+                    )
+                } else {
+                    updateTransfer(transfer.id, status: .running, detail: "正在下载", startedAt: .now)
+                    try await session.client.download(
+                        item,
+                        to: directory.appendingPathComponent(item.name),
+                        progress: transferProgressHandler(for: transfer.id, totalBytes: item.size)
+                    )
+                    updateTransfer(
+                        transfer.id,
+                        status: .succeeded,
+                        detail: "下载完成",
+                        finishedAt: .now,
+                        completedBytes: item.size ?? 0
+                    )
+                }
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
                 lastError = error.localizedDescription
             }
         }
+    }
+
+    private func download(
+        folder plan: FolderDownloadPlan,
+        to destinationDirectory: URL,
+        client: any RemoteClient,
+        transferID: UUID
+    ) async throws -> Int64 {
+        for (index, remoteDirectory) in plan.directories.enumerated() {
+            updateTransfer(
+                transferID,
+                status: .running,
+                detail: "正在创建本地文件夹 \(index + 1)/\(plan.directories.count)"
+            )
+            try FileManager.default.createDirectory(
+                at: try plan.destinationURL(for: remoteDirectory, in: destinationDirectory),
+                withIntermediateDirectories: true
+            )
+        }
+
+        var completedBytes: Int64 = 0
+        for (index, remoteFile) in plan.files.enumerated() {
+            updateTransfer(
+                transferID,
+                status: .running,
+                detail: "正在下载文件 \(index + 1)/\(plan.files.count)"
+            )
+            try await client.download(
+                remoteFile,
+                to: try plan.destinationURL(for: remoteFile, in: destinationDirectory),
+                progress: transferProgressHandler(
+                    for: transferID,
+                    offset: completedBytes,
+                    totalBytes: plan.totalBytes,
+                    useReportedTotal: plan.totalBytes != nil
+                )
+            )
+            completedBytes += remoteFile.size ?? 0
+            updateTransfer(
+                transferID,
+                status: .running,
+                detail: "正在下载文件 \(index + 1)/\(plan.files.count)",
+                completedBytes: completedBytes
+            )
+        }
+        return completedBytes
     }
 
     private func enqueueCopy(_ item: RemoteItem, destination: String, session: RemoteSession) {
@@ -524,12 +636,13 @@ final class WorkspaceStore: ObservableObject {
     private func transferProgressHandler(
         for transferID: UUID,
         offset: Int64 = 0,
-        totalBytes: Int64?
+        totalBytes: Int64?,
+        useReportedTotal: Bool = true
     ) -> TransferProgressHandler {
         { [weak self] completedBytes, reportedTotalBytes in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let total = totalBytes ?? reportedTotalBytes.map { offset + $0 }
+                let total = totalBytes ?? (useReportedTotal ? reportedTotalBytes.map { offset + $0 } : nil)
                 self.recordTransferProgress(transferID, completedBytes: offset + completedBytes, totalBytes: total)
             }
         }
