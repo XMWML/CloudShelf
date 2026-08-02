@@ -39,6 +39,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         window.minSize = NSSize(width: 980, height: 620)
         super.init(window: window)
         window.contentViewController = FileManagerViewController(owner: self)
+        configureMainMenu()
         configureToolbar()
         refreshTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(refreshViews), userInfo: nil, repeats: true)
     }
@@ -189,6 +190,23 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         Task { [weak self] in await session.goUp(); self?.refreshViews() }
     }
 
+    func connectSelected() {
+        guard let profile = selectedProfile else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.store.mount(profile)
+            self.session = self.store.sessions[profile.id]
+            self.refreshViews()
+        }
+    }
+
+    func disconnectSelected() {
+        guard let profile = selectedProfile else { return }
+        store.unmount(profile)
+        session = nil
+        refreshViews()
+    }
+
     func newFolder() {
         guard let session else { return }
         prompt(title: "New Folder", message: "Create a folder in \(session.location)", placeholder: "Folder name") { [weak self] name in
@@ -305,6 +323,76 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         window?.toolbar = toolbar
     }
 
+    private func configureMainMenu() {
+        let main = NSMenu()
+        main.addItem(applicationMenu())
+        main.addItem(menu(title: "连接", items: [
+            menuItem("新建连接", #selector(addAction), key: "n"),
+            menuItem("编辑连接", #selector(editAction), key: "e"),
+            .separator(),
+            menuItem("连接", #selector(connectAction)),
+            menuItem("断开连接", #selector(disconnectAction)),
+            .separator(),
+            menuItem("删除连接", #selector(removeConnection), key: "", modifiers: [])
+        ]))
+        main.addItem(menu(title: "文件", items: [
+            menuItem("新建文件夹", #selector(folderAction), key: "n", modifiers: [.command, .shift]),
+            menuItem("上传", #selector(uploadAction), key: "u"),
+            menuItem("下载", #selector(downloadAction), key: "d"),
+            .separator(),
+            menuItem("重命名", #selector(renameAction)),
+            menuItem("复制到文件夹", #selector(copyAction)),
+            menuItem("移动到文件夹", #selector(moveAction)),
+            menuItem("删除", #selector(deleteAction), key: "\u{8}")
+        ]))
+        main.addItem(menu(title: "视图", items: [
+            menuItem("上级目录", #selector(upAction), key: "\u{F700}"),
+            menuItem("刷新", #selector(reloadAction), key: "r"),
+            .separator(),
+            menuItem("显示或隐藏工具栏", #selector(toggleToolbarAction), key: "t", modifiers: [.command, .option])
+        ]))
+        main.addItem(menu(title: "同步", items: [
+            menuItem("配置自动同步", #selector(configureSyncAction)),
+            menuItem("立即同步", #selector(syncAction))
+        ]))
+        main.addItem(menu(title: "帮助", items: [
+            menuItem("中文使用说明", #selector(showChineseReadme))
+        ]))
+        NSApp.mainMenu = main
+    }
+
+    private func applicationMenu() -> NSMenuItem {
+        let item = NSMenuItem(title: "CloudShelf", action: nil, keyEquivalent: "")
+        let app = NSMenu(title: "CloudShelf")
+        app.addItem(menuItem("关于 CloudShelf", #selector(showAbout)))
+        app.addItem(.separator())
+        let quit = NSMenuItem(title: "退出 CloudShelf", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        app.addItem(quit)
+        item.submenu = app
+        return item
+    }
+
+    private func menu(title: String, items: [NSMenuItem]) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: title)
+        items.forEach(submenu.addItem)
+        item.submenu = submenu
+        return item
+    }
+
+    private func menuItem(
+        _ title: String,
+        _ action: Selector,
+        key: String = "",
+        modifiers: NSEvent.ModifierFlags = [.command]
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
+        item.target = self
+        return item
+    }
+
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(toolbar) }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -337,15 +425,34 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     @objc fileprivate func addAction() { addConnection() }
     @objc fileprivate func editAction() { editConnection() }
+    @objc fileprivate func connectAction() { connectSelected() }
+    @objc fileprivate func disconnectAction() { disconnectSelected() }
     @objc fileprivate func upAction() { goUp() }
     @objc fileprivate func reloadAction() { reloadFolder() }
     @objc fileprivate func folderAction() { newFolder() }
     @objc fileprivate func uploadAction() { chooseUploads() }
     @objc fileprivate func downloadAction() { chooseDownloads() }
+    @objc fileprivate func renameAction() { rename() }
     @objc fileprivate func copyAction() { copyItems() }
     @objc fileprivate func moveAction() { moveItems() }
     @objc fileprivate func deleteAction() { deleteItems() }
     @objc fileprivate func syncAction() { runSync() }
+    @objc fileprivate func configureSyncAction() { configureSync() }
+    @objc fileprivate func toggleToolbarAction() { window?.toggleToolbarShown(self) }
+
+    @objc private func showAbout() {
+        let alert = NSAlert()
+        alert.messageText = "CloudShelf"
+        alert.informativeText = "FTP、SFTP、WebDAV 应用内文件工作区\n不使用 Finder 挂载 API 或 macFUSE。"
+        alert.runModal()
+    }
+
+    @objc private func showChineseReadme() {
+        let alert = NSAlert()
+        alert.messageText = "CloudShelf 使用说明"
+        alert.informativeText = "1. 选择“连接 > 新建连接”添加服务器。\n2. 在左侧选择服务器并浏览文件。\n3. 使用“文件”菜单上传、下载、移动、复制或删除。\n4. 使用“同步”菜单设置本地文件夹的自动同步。\n\n完整中文说明位于项目目录的 README.zh-CN.md。"
+        alert.runModal()
+    }
 
     private func presentForm(title: String, form: NSView, actionTitle: String, completion: @escaping () -> Void) {
         let alert = NSAlert()
@@ -540,7 +647,7 @@ private final class FileManagerViewController: NSViewController {
     }
 }
 
-private final class ConnectionForm: NSStackView {
+private final class ConnectionForm: NSView {
     private let name = NSTextField(string: "")
     private let protocolBox = NSPopUpButton()
     private let host = NSTextField(string: "")
@@ -559,24 +666,15 @@ private final class ConnectionForm: NSStackView {
     }
 
     init(profile: ConnectionProfile? = nil) {
-        super.init(frame: .zero)
-        orientation = .vertical
-        alignment = .leading
-        spacing = 8
+        super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 364))
         protocolBox.addItems(withTitles: RemoteProtocol.allCases.map(\.rawValue))
         authentication.addItems(withTitles: AuthenticationMethod.allCases.map(\.rawValue))
         hostKeyPolicy.addItems(withTitles: HostKeyPolicy.allCases.map(\.rawValue))
-        addArrangedSubview(row("Name", name))
-        addArrangedSubview(row("Protocol", protocolBox))
-        addArrangedSubview(row("Host", host))
-        addArrangedSubview(row("Port", port))
-        addArrangedSubview(row("Username", username))
-        addArrangedSubview(row("Remote root", root))
-        addArrangedSubview(row("Authentication", authentication))
-        addArrangedSubview(row("Password", secretField))
-        addArrangedSubview(row("Private key", keyPath))
-        addArrangedSubview(row("Host key", hostKeyPolicy))
-        addArrangedSubview(tls)
+        layout(rows: [
+            ("Name", name), ("Protocol", protocolBox), ("Host", host), ("Port", port),
+            ("Username", username), ("Remote root", root), ("Authentication", authentication),
+            ("Password", secretField), ("Private key", keyPath), ("Host key", hostKeyPolicy), ("", tls)
+        ])
         if let profile {
             name.stringValue = profile.name
             protocolBox.selectItem(withTitle: profile.protocolType.rawValue)
@@ -597,6 +695,8 @@ private final class ConnectionForm: NSStackView {
 
     required init?(coder: NSCoder) { nil }
 
+    override var intrinsicContentSize: NSSize { NSSize(width: 440, height: 364) }
+
     func profile(existing: ConnectionProfile? = nil) -> ConnectionProfile? {
         guard let protocolType = RemoteProtocol(rawValue: protocolBox.titleOfSelectedItem ?? ""),
               let method = AuthenticationMethod(rawValue: authentication.titleOfSelectedItem ?? ""),
@@ -613,57 +713,71 @@ private final class ConnectionForm: NSStackView {
         )
     }
 
-    private func row(_ label: String, _ field: NSView) -> NSStackView {
-        if let control = field as? NSControl { control.widthAnchor.constraint(equalToConstant: 290).isActive = true }
-        let text = NSTextField(labelWithString: label)
-        text.alignment = .right
-        text.widthAnchor.constraint(equalToConstant: 105).isActive = true
-        let row = NSStackView(views: [text, field])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
-        return row
+    private func layout(rows: [(String, NSView)]) {
+        let views = rows.map { label, field -> [NSView] in
+            let text = NSTextField(labelWithString: label)
+            text.alignment = .right
+            return [text, field]
+        }
+        let grid = NSGridView(views: views)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.xPlacement = .fill
+        grid.yPlacement = .center
+        grid.column(at: 0).width = 110
+        grid.column(at: 1).width = 300
+        addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.leadingAnchor.constraint(equalTo: leadingAnchor), grid.trailingAnchor.constraint(equalTo: trailingAnchor),
+            grid.topAnchor.constraint(equalTo: topAnchor), grid.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
     }
 }
 
-private final class SyncForm: NSStackView {
+private final class SyncForm: NSView {
     private let local = NSTextField(string: "")
     private let remote = NSTextField(string: "/")
     private let direction = NSPopUpButton()
     private let interval = NSPopUpButton()
 
     init(localFolder: String) {
-        super.init(frame: .zero)
-        orientation = .vertical
-        alignment = .leading
-        spacing = 8
+        super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 132))
         local.stringValue = localFolder
         local.isEditable = false
         direction.addItems(withTitles: SyncDirection.allCases.map(\.rawValue))
         interval.addItems(withTitles: ["5 minutes", "15 minutes", "30 minutes", "1 hour"])
         interval.selectItem(at: 1)
-        addArrangedSubview(row("Local folder", local))
-        addArrangedSubview(row("Remote folder", remote))
-        addArrangedSubview(row("Direction", direction))
-        addArrangedSubview(row("Frequency", interval))
+        layout(rows: [("Local folder", local), ("Remote folder", remote), ("Direction", direction), ("Frequency", interval)])
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 440, height: 132) }
 
     func rule() -> SyncRule {
         let minutes = [5, 15, 30, 60][max(0, interval.indexOfSelectedItem)]
         return SyncRule(localFolder: local.stringValue, remoteFolder: remote.stringValue, direction: SyncDirection(rawValue: direction.titleOfSelectedItem ?? "") ?? .uploadOnly, intervalMinutes: minutes)
     }
 
-    private func row(_ label: String, _ field: NSView) -> NSStackView {
-        if let control = field as? NSControl { control.widthAnchor.constraint(equalToConstant: 290).isActive = true }
-        let text = NSTextField(labelWithString: label)
-        text.alignment = .right
-        text.widthAnchor.constraint(equalToConstant: 105).isActive = true
-        let row = NSStackView(views: [text, field])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
-        return row
+    private func layout(rows: [(String, NSView)]) {
+        let views = rows.map { label, field -> [NSView] in
+            let text = NSTextField(labelWithString: label)
+            text.alignment = .right
+            return [text, field]
+        }
+        let grid = NSGridView(views: views)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.xPlacement = .fill
+        grid.yPlacement = .center
+        grid.column(at: 0).width = 110
+        grid.column(at: 1).width = 300
+        addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.leadingAnchor.constraint(equalTo: leadingAnchor), grid.trailingAnchor.constraint(equalTo: trailingAnchor),
+            grid.topAnchor.constraint(equalTo: topAnchor), grid.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
     }
 }
