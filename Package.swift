@@ -19,7 +19,7 @@ let package = Package(
             dependencies: ["CloudShelfCore"],
             path: "Sources/CloudShelf",
             exclude: ["Domain", "Infrastructure"],
-            sources: ["App/WorkspaceStore.swift", "AppKit"]
+            sources: ["App/LocalNetworkAccessRequester.swift", "App/WorkspaceStore.swift", "AppKit"]
         ),
         .executableTarget(
             name: "CloudShelfSmoke",

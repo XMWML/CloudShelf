@@ -135,6 +135,7 @@ final class WorkspaceStore: ObservableObject {
 
     func mount(_ profile: ConnectionProfile) async {
         guard sessions[profile.id] == nil else { return }
+        LocalNetworkAccessRequester.shared.requestAccess(for: profile)
         do {
             let session = RemoteSession(profile: profile, client: try RemoteClientFactory.make(profile: profile))
             sessions[profile.id] = session
