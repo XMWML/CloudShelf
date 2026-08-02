@@ -8,11 +8,14 @@ final class LocalNetworkAccessRequester {
 
     private var requestedTargets = Set<String>()
     private var connection: NWConnection?
+    private var browser: NWBrowser?
+    private var didStartBonjourProbe = false
     private let queue = DispatchQueue(label: "CloudShelf.LocalNetworkAccess")
 
     private init() {}
 
     func requestAccess(for profile: ConnectionProfile) {
+        startBonjourProbeIfNeeded()
         guard let target = target(for: profile) else { return }
         guard requestedTargets.insert("\(target.host):\(target.port)").inserted else { return }
 
@@ -37,6 +40,28 @@ final class LocalNetworkAccessRequester {
             guard self?.connection === connection else { return }
             connection?.cancel()
             self?.connection = nil
+        }
+    }
+
+    private func startBonjourProbeIfNeeded() {
+        guard !didStartBonjourProbe else { return }
+        didStartBonjourProbe = true
+
+        let browser = NWBrowser(for: .bonjour(type: "_webdav._tcp", domain: nil), using: .tcp)
+        self.browser = browser
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            guard case .failed = state else { return }
+            DispatchQueue.main.async {
+                guard self?.browser === browser else { return }
+                self?.browser = nil
+            }
+        }
+        browser.start(queue: queue)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self, weak browser] in
+            guard self?.browser === browser else { return }
+            browser?.cancel()
+            self?.browser = nil
         }
     }
 

@@ -16,6 +16,10 @@
     <string>0.1.0</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>CloudShelf 需要访问本地网络中的 FTP、SFTP 和 WebDAV 服务器。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_webdav._tcp</string>
+    </array>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>
