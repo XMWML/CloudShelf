@@ -71,7 +71,7 @@ actor WebDAVRemoteClient: RemoteClient {
         } catch let error as CloudShelfError {
             throw error
         } catch {
-            throw CloudShelfError.commandFailed("WebDAV 下载失败：\(error.localizedDescription)")
+            throw CloudShelfError.commandFailed("WebDAV 下载失败：\(networkErrorDescription(error))")
         }
     }
 
@@ -84,7 +84,7 @@ actor WebDAVRemoteClient: RemoteClient {
         } catch let error as CloudShelfError {
             throw error
         } catch {
-            throw CloudShelfError.commandFailed("WebDAV 上传失败：\(error.localizedDescription)")
+            throw CloudShelfError.commandFailed("WebDAV 上传失败：\(networkErrorDescription(error))")
         }
     }
 
@@ -124,7 +124,26 @@ actor WebDAVRemoteClient: RemoteClient {
         } catch let error as CloudShelfError {
             throw error
         } catch {
-            throw CloudShelfError.commandFailed("WebDAV \(operation)失败：\(error.localizedDescription)")
+            throw CloudShelfError.commandFailed("WebDAV \(operation)失败：\(networkErrorDescription(error))")
+        }
+    }
+
+    private func networkErrorDescription(_ error: Error) -> String {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else {
+            return error.localizedDescription
+        }
+        let code = URLError.Code(rawValue: nsError.code)
+
+        switch code {
+        case .notConnectedToInternet:
+            return "系统网络框架将此连接标记为未联网。请检查 VPN、代理或“网络扩展”是否正在拦截 CloudShelf；将本应用设为直连后重试。原始原因：\(error.localizedDescription)"
+        case .cannotConnectToHost, .networkConnectionLost:
+            return "系统无法建立到服务器的连接。请检查服务器地址、网络和 VPN、代理或“网络扩展”的直连规则。原始原因：\(error.localizedDescription)"
+        case .timedOut:
+            return "连接服务器超时。请检查服务器是否可达，以及 VPN、代理或“网络扩展”的直连规则。原始原因：\(error.localizedDescription)"
+        default:
+            return error.localizedDescription
         }
     }
 
