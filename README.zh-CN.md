@@ -99,6 +99,8 @@ http://[2409:8a55:4e87:a560:aaae:68de:76eb:5550]:5244/dav
 make build       # 构建 Release 可执行文件
 make test        # 执行 7 项核心冒烟检查
 make bundle      # 生成 dist/CloudShelf.app
+make dmg         # 生成 dist/ 中的通用 DMG 安装包
+make install     # 安装到 /Applications
 open dist/CloudShelf.app
 ```
 

@@ -50,6 +50,8 @@ From this project directory:
 make build       # Build the Release executable
 make test        # Run seven core smoke assertions
 make bundle      # Create dist/CloudShelf.app
+make dmg         # Create a universal DMG in dist/
+make install     # Install the app in /Applications
 open dist/CloudShelf.app
 ```
 
