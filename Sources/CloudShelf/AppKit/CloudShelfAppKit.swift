@@ -80,6 +80,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private var restoringConnectionSelection = false
     private var propertiesWindowController: RemoteItemPropertiesWindowController?
     private var syncRulesWindowController: SyncRulesWindowController?
+    private weak var automaticSyncToolbarItem: NSToolbarItem?
 
     init() {
         let window = NSWindow(
@@ -91,6 +92,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         window.title = "CloudShelf"
         window.minSize = NSSize(width: 980, height: 620)
         super.init(window: window)
+        window.center()
         window.contentViewController = FileManagerViewController(owner: self)
         configureMainMenu()
         configureToolbar()
@@ -755,8 +757,9 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         [
             NSToolbarItem.Identifier("add"), NSToolbarItem.Identifier("edit"), .flexibleSpace,
             NSToolbarItem.Identifier("up"), NSToolbarItem.Identifier("reload"), NSToolbarItem.Identifier("folder"),
-            NSToolbarItem.Identifier("upload"), NSToolbarItem.Identifier("download"), NSToolbarItem.Identifier("copy"),
-            NSToolbarItem.Identifier("move"), NSToolbarItem.Identifier("delete"), NSToolbarItem.Identifier("sync")
+            NSToolbarItem.Identifier("upload"), NSToolbarItem.Identifier("download"), NSToolbarItem.Identifier("rename"),
+            NSToolbarItem.Identifier("properties"), NSToolbarItem.Identifier("copy"), NSToolbarItem.Identifier("move"),
+            NSToolbarItem.Identifier("delete"), NSToolbarItem.Identifier("sync"), NSToolbarItem.Identifier("automaticSync")
         ]
     }
 
@@ -770,10 +773,17 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         case "folder": item.label = "新建文件夹"; item.toolTip = "新建文件夹"; item.image = symbol("folder.badge.plus"); item.target = self; item.action = #selector(folderAction)
         case "upload": item.label = "上传"; item.toolTip = "上传文件或文件夹"; item.image = symbol("arrow.up.doc"); item.target = self; item.action = #selector(uploadAction)
         case "download": item.label = "下载"; item.toolTip = "下载所选文件"; item.image = symbol("arrow.down.doc"); item.target = self; item.action = #selector(downloadAction)
+        case "rename": item.label = "重命名"; item.toolTip = "重命名所选项目"; item.image = symbol("pencil"); item.target = self; item.action = #selector(renameAction)
+        case "properties": item.label = "属性"; item.toolTip = "查看所选项目属性"; item.image = symbol("info.circle"); item.target = self; item.action = #selector(propertiesAction)
         case "copy": item.label = "复制"; item.toolTip = "复制到指定文件夹"; item.image = symbol("doc.on.doc"); item.target = self; item.action = #selector(copyAction)
         case "move": item.label = "移动"; item.toolTip = "移动到指定文件夹"; item.image = symbol("folder.badge.gearshape"); item.target = self; item.action = #selector(moveAction)
         case "delete": item.label = "删除"; item.toolTip = "删除所选文件"; item.image = symbol("trash"); item.target = self; item.action = #selector(deleteAction)
         case "sync": item.label = "同步"; item.toolTip = "配置或执行自动同步"; item.image = symbol("arrow.triangle.2.circlepath"); item.target = self; item.action = #selector(syncAction)
+        case "automaticSync":
+            automaticSyncToolbarItem = item
+            updateAutomaticSyncToolbarItem()
+            item.target = self
+            item.action = #selector(toggleAutomaticSyncAction)
         default: return nil
         }
         return item
@@ -798,8 +808,20 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc fileprivate func deleteAction() { deleteItems() }
     @objc fileprivate func propertiesAction() { showProperties() }
     @objc fileprivate func syncAction() { runSync() }
+    @objc fileprivate func toggleAutomaticSyncAction() {
+        store.toggleAutomaticSync()
+        updateAutomaticSyncToolbarItem()
+    }
     @objc fileprivate func configureSyncAction() { configureSync() }
     @objc fileprivate func toggleToolbarAction() { window?.toggleToolbarShown(self) }
+
+    private func updateAutomaticSyncToolbarItem() {
+        guard let item = automaticSyncToolbarItem else { return }
+        let enabled = store.automaticSyncEnabled
+        item.label = enabled ? "自动同步：开" : "自动同步：关"
+        item.toolTip = enabled ? "关闭所有定时和本地变更自动同步" : "开启定时和本地变更自动同步"
+        item.image = symbol(enabled ? "arrow.triangle.2.circlepath.circle.fill" : "pause.circle")
+    }
 
     @objc private func showAbout() {
         let alert = NSAlert()
@@ -967,6 +989,7 @@ private final class RemoteItemPropertiesWindowController: NSWindowController {
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         super.init(window: panel)
+        panel.center()
         panel.contentView = makeContentView(panel: panel)
     }
 
@@ -1467,6 +1490,7 @@ private final class SyncRulesWindowController: NSWindowController, NSTableViewDa
         )
         window.title = "同步管理 - \(profile.name)"
         super.init(window: window)
+        window.center()
         window.contentView = makeContentView(window: window)
     }
 
@@ -1667,6 +1691,7 @@ private final class SyncRuleEditorWindowController: NSWindowController {
         )
         window.title = existing == nil ? "添加同步规则" : "编辑同步规则"
         super.init(window: window)
+        window.center()
         interval.addItems(withTitles: ["5 分钟", "15 分钟", "30 分钟", "1 小时"])
         applyExistingRule()
         window.contentView = makeContentView(window: window)
@@ -1825,6 +1850,7 @@ private final class RemoteFolderPickerWindowController: NSWindowController, NSTa
         )
         window.title = "选择远端文件夹"
         super.init(window: window)
+        window.center()
         window.contentView = makeContentView(window: window)
         reload()
     }

@@ -15,6 +15,7 @@ CloudShelf is a native macOS FTP, SFTP, and WebDAV workspace manager. It present
 - Support SFTP password, SSH agent, and private-key authentication.
 - Store SFTP host fingerprints in CloudShelf's own `known_hosts` file. Choose either strict checking or accepting a host key on first connection.
 - Add, edit, enable, disable, remove, and run multiple local-folder sync rules per connection. Each rule independently selects local upload, remote download, local deletion to remote, and remote deletion to local; select remote folders from the server browser and optionally trigger rules after local changes.
+- Use the toolbar's global automatic-sync switch to pause or resume all scheduled and local-change-triggered rules without stopping an active transfer. Manual sync remains available.
 
 ## No FUSE and no Finder mount API
 

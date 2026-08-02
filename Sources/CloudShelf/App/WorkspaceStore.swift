@@ -196,6 +196,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var profiles: [ConnectionProfile] = []
     @Published private(set) var sessions: [UUID: RemoteSession] = [:]
     @Published private(set) var transfers: [TransferTask] = []
+    @Published private(set) var automaticSyncEnabled: Bool
     @Published var lastError: String?
 
     private let profileStore = ProfileStore()
@@ -205,8 +206,10 @@ final class WorkspaceStore: ObservableObject {
     private var localFingerprints: [UUID: LocalFolderFingerprint] = [:]
     private var fingerprintingRuleIDs = Set<UUID>()
     private var pendingChangeSyncs: [UUID: Date] = [:]
+    private static let automaticSyncEnabledKey = "CloudShelf.automaticSyncEnabled"
 
     init() {
+        automaticSyncEnabled = UserDefaults.standard.object(forKey: Self.automaticSyncEnabledKey) as? Bool ?? true
         Task {
             profiles = await profileStore.load().sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
@@ -220,6 +223,12 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func isMounted(_ id: UUID) -> Bool { sessions[id] != nil }
+
+    func toggleAutomaticSync() {
+        automaticSyncEnabled.toggle()
+        UserDefaults.standard.set(automaticSyncEnabled, forKey: Self.automaticSyncEnabledKey)
+        if !automaticSyncEnabled { pendingChangeSyncs.removeAll() }
+    }
 
     func save(profile: ConnectionProfile, secret: String?) async {
         do {
@@ -566,6 +575,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func runScheduledSyncs() {
+        guard automaticSyncEnabled else { return }
         let now = Date.now
         detectLocalFolderChanges()
         for profile in profiles where sessions[profile.id] != nil {
