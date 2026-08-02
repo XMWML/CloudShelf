@@ -1,0 +1,172 @@
+import Foundation
+
+actor WebDAVRemoteClient: RemoteClient {
+    private let profile: ConnectionProfile
+    private let endpoint: RemoteEndpoint
+    private let session: URLSession
+    private let authenticationDelegate: WebDAVAuthenticationDelegate
+
+    init(profile: ConnectionProfile, password: String?) throws {
+        guard let password else { throw CloudShelfError.missingCredential }
+        let endpoint = try RemoteEndpoint(profile: profile)
+        self.profile = endpoint.profile
+        self.endpoint = endpoint
+        let delegate = WebDAVAuthenticationDelegate(username: endpoint.profile.username, password: password)
+        self.authenticationDelegate = delegate
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 300
+        self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+    }
+
+    func list(at path: String) async throws -> [RemoteItem] {
+        let requestBody = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <d:propfind xmlns:d="DAV:">
+          <d:prop><d:displayname/><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop>
+        </d:propfind>
+        """
+        let request = try request(
+            path: path,
+            method: "PROPFIND",
+            headers: ["Depth": "1", "Content-Type": "application/xml; charset=utf-8"],
+            body: Data(requestBody.utf8)
+        )
+        let (data, _) = try await execute(request, operation: "列出目录")
+        return try WebDAVListingParser.parse(String(decoding: data, as: UTF8.self), endpoint: endpoint, requestedPath: path)
+    }
+
+    func createDirectory(named name: String, in parent: String) async throws {
+        try validateName(name)
+        let request = try request(path: RemotePath.join(parent, name), method: "MKCOL")
+        _ = try await execute(request, operation: "创建文件夹")
+    }
+
+    func delete(_ item: RemoteItem) async throws {
+        let request = try request(path: item.path, method: "DELETE")
+        _ = try await execute(request, operation: "删除")
+    }
+
+    func rename(_ item: RemoteItem, to newName: String) async throws {
+        try validateName(newName)
+        let destination = RemotePath.join(RemotePath.parent(of: item.path), newName)
+        try await movePath(item.path, destination: destination)
+    }
+
+    func move(_ item: RemoteItem, to directory: String) async throws {
+        try await movePath(item.path, destination: RemotePath.join(directory, item.name))
+    }
+
+    func download(_ item: RemoteItem, to localURL: URL) async throws {
+        let request = try request(path: item.path, method: "GET")
+        do {
+            let (temporaryURL, response) = try await session.download(for: request)
+            try validate(response, operation: "下载")
+            try FileManager.default.createDirectory(at: localURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: localURL.path) {
+                try FileManager.default.removeItem(at: localURL)
+            }
+            try FileManager.default.moveItem(at: temporaryURL, to: localURL)
+        } catch let error as CloudShelfError {
+            throw error
+        } catch {
+            throw CloudShelfError.commandFailed("WebDAV 下载失败：\(error.localizedDescription)")
+        }
+    }
+
+    func upload(_ localURL: URL, to directory: String) async throws {
+        let target = RemotePath.join(directory, localURL.lastPathComponent)
+        let request = try request(path: target, method: "PUT")
+        do {
+            let (_, response) = try await session.upload(for: request, fromFile: localURL)
+            try validate(response, operation: "上传")
+        } catch let error as CloudShelfError {
+            throw error
+        } catch {
+            throw CloudShelfError.commandFailed("WebDAV 上传失败：\(error.localizedDescription)")
+        }
+    }
+
+    func copy(_ item: RemoteItem, to directory: String) async throws {
+        let destination = try endpoint.url(for: RemotePath.join(directory, item.name)).absoluteString
+        let request = try request(
+            path: item.path,
+            method: "COPY",
+            headers: ["Destination": destination, "Overwrite": "T", "Depth": "infinity"]
+        )
+        _ = try await execute(request, operation: "复制")
+    }
+
+    private func movePath(_ source: String, destination: String) async throws {
+        let destinationURL = try endpoint.url(for: destination).absoluteString
+        let request = try request(
+            path: source,
+            method: "MOVE",
+            headers: ["Destination": destinationURL, "Overwrite": "T"]
+        )
+        _ = try await execute(request, operation: "移动")
+    }
+
+    private func request(path: String, method: String, headers: [String: String] = [:], body: Data? = nil) throws -> URLRequest {
+        var request = URLRequest(url: try endpoint.url(for: path))
+        request.httpMethod = method
+        request.httpBody = body
+        headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+        return request
+    }
+
+    private func execute(_ request: URLRequest, operation: String) async throws -> (Data, HTTPURLResponse) {
+        do {
+            let (data, response) = try await session.data(for: request)
+            let httpResponse = try validate(response, operation: operation, body: data)
+            return (data, httpResponse)
+        } catch let error as CloudShelfError {
+            throw error
+        } catch {
+            throw CloudShelfError.commandFailed("WebDAV \(operation)失败：\(error.localizedDescription)")
+        }
+    }
+
+    @discardableResult
+    private func validate(_ response: URLResponse, operation: String, body: Data? = nil) throws -> HTTPURLResponse {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CloudShelfError.invalidResponse("WebDAV \(operation)没有返回 HTTP 响应。")
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let detail = body.flatMap { String(data: $0, encoding: .utf8) }
+                .map { String($0.prefix(500)).trimmingCharacters(in: .whitespacesAndNewlines) }
+            let suffix = detail.map { "：\($0)" } ?? ""
+            throw CloudShelfError.commandFailed("WebDAV \(operation)失败（HTTP \(httpResponse.statusCode)）\(suffix)")
+        }
+        return httpResponse
+    }
+
+    private func validateName(_ name: String) throws {
+        guard !name.isEmpty, !name.contains("/"), !name.contains("\n"), name != ".", name != ".." else {
+            throw CloudShelfError.invalidProfile("名称不能包含斜杠或换行。")
+        }
+    }
+}
+
+private final class WebDAVAuthenticationDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let credential: URLCredential
+
+    init(username: String, password: String) {
+        credential = URLCredential(user: username, password: password, persistence: .forSession)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        switch challenge.protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest:
+            completionHandler(.useCredential, credential)
+        default:
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}

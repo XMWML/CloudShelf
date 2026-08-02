@@ -120,8 +120,10 @@ public enum RemoteClientFactory {
     public static func make(profile: ConnectionProfile) throws -> any RemoteClient {
         let secret = try CredentialStore.load(profileID: profile.id)
         switch profile.protocolType {
-        case .ftp, .webDAV:
+        case .ftp:
             return try CurlRemoteClient(profile: profile, password: secret)
+        case .webDAV:
+            return try WebDAVRemoteClient(profile: profile, password: secret)
         case .sftp:
             return try SFTPRemoteClient(profile: profile, secret: secret)
         }

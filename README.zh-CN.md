@@ -69,10 +69,10 @@ http://[2409:8a55:4e87:a560:aaae:68de:76eb:5550]:5244/dav
 | 协议 | 传输引擎 | 支持的远端操作 |
 | --- | --- | --- |
 | FTP / FTPS | `/usr/bin/curl` | 列表、上传、下载、建目录、删除、重命名 |
-| WebDAV / HTTPS | `/usr/bin/curl` + 应用内 DAV XML 解析 | PROPFIND、上传、下载、MKCOL、DELETE、MOVE、COPY |
+| WebDAV / HTTPS | 应用内 URLSession + DAV XML 解析 | PROPFIND、上传、下载、MKCOL、DELETE、MOVE、COPY |
 | SFTP | `/usr/bin/sftp` | 列表、上传、下载、建目录、删除、重命名 |
 
-这些是协议传输层，并不调用 Finder 操作。curl 凭据通过权限受限的临时配置文件传递；SFTP 密码使用短生命周期的 `SSH_ASKPASS` 桥接。所有临时文件都会在操作结束后删除。命令输出会写入临时文件，避免大目录列表填满管道后卡住。
+这些是协议传输层，并不调用 Finder 操作。WebDAV 请求直接从 CloudShelf 进程发出，因此本地网络授权会归属到应用本身；FTP 凭据通过权限受限的临时 curl 配置文件传递；SFTP 密码使用短生命周期的 `SSH_ASKPASS` 桥接。所有临时文件都会在操作结束后删除。命令输出会写入临时文件，避免大目录列表填满管道后卡住。
 
 ## 安全与数据位置
 

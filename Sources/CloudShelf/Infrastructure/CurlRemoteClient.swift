@@ -154,7 +154,7 @@ actor CurlRemoteClient: RemoteClient {
     }
 }
 
-private final class WebDAVListingParser: NSObject, XMLParserDelegate {
+final class WebDAVListingParser: NSObject, XMLParserDelegate {
     private struct Entry {
         var href = ""
         var name = ""
