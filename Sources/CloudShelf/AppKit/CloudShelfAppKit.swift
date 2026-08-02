@@ -1,7 +1,6 @@
 import AppKit
 import CloudShelfCore
 
-@main
 final class CloudShelfApplication: NSObject, NSApplicationDelegate {
     private var controller: FileManagerWindowController?
 
@@ -39,7 +38,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         window.title = "CloudShelf"
         window.minSize = NSSize(width: 980, height: 620)
         super.init(window: window)
-        contentViewController = FileManagerViewController(owner: self)
+        window.contentViewController = FileManagerViewController(owner: self)
         configureToolbar()
         refreshTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(refreshViews), userInfo: nil, repeats: true)
     }

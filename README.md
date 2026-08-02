@@ -2,6 +2,8 @@
 
 CloudShelf is a native macOS FTP, SFTP, and WebDAV workspace manager. It presents remote servers as persistent workspaces inside its own file-manager window, so users can work with several servers at once without using Finder's network-volume APIs.
 
+[中文文档](README.zh-CN.md)
+
 ## What it does
 
 - Connect and switch between multiple FTP, SFTP, and WebDAV servers.
