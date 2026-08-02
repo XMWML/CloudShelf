@@ -1,5 +1,7 @@
 import Foundation
 
+public typealias TransferProgressHandler = @Sendable (_ completedBytes: Int64, _ totalBytes: Int64?) -> Void
+
 public protocol RemoteClient: Sendable {
     func list(at path: String) async throws -> [RemoteItem]
     func createDirectory(named name: String, in parent: String) async throws
@@ -8,10 +10,20 @@ public protocol RemoteClient: Sendable {
     func move(_ item: RemoteItem, to directory: String) async throws
     func download(_ item: RemoteItem, to localURL: URL) async throws
     func upload(_ localURL: URL, to directory: String) async throws
+    func download(_ item: RemoteItem, to localURL: URL, progress: TransferProgressHandler?) async throws
+    func upload(_ localURL: URL, to directory: String, progress: TransferProgressHandler?) async throws
     func copy(_ item: RemoteItem, to directory: String) async throws
 }
 
 extension RemoteClient {
+    func download(_ item: RemoteItem, to localURL: URL, progress: TransferProgressHandler?) async throws {
+        try await download(item, to: localURL)
+    }
+
+    func upload(_ localURL: URL, to directory: String, progress: TransferProgressHandler?) async throws {
+        try await upload(localURL, to: directory)
+    }
+
     func copy(_ item: RemoteItem, to directory: String) async throws {
         let destination = RemotePath.join(directory, item.name)
         if item.isDirectory {

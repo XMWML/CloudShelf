@@ -5,19 +5,19 @@ actor WebDAVRemoteClient: RemoteClient {
     private let endpoint: RemoteEndpoint
     private let session: URLSession
     private let authenticationDelegate: WebDAVAuthenticationDelegate
+    private let username: String
+    private let password: String
 
     init(profile: ConnectionProfile, password: String?) throws {
         guard let password else { throw CloudShelfError.missingCredential }
         let endpoint = try RemoteEndpoint(profile: profile)
         self.profile = endpoint.profile
         self.endpoint = endpoint
-        let delegate = WebDAVAuthenticationDelegate(username: endpoint.profile.username, password: password)
+        self.username = endpoint.profile.username
+        self.password = password
+        let delegate = WebDAVAuthenticationDelegate(username: endpoint.profile.username, password: password, progress: nil)
         self.authenticationDelegate = delegate
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 300
-        self.session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        self.session = URLSession(configuration: Self.sessionConfiguration(), delegate: delegate, delegateQueue: nil)
     }
 
     func list(at path: String) async throws -> [RemoteItem] {
@@ -59,9 +59,16 @@ actor WebDAVRemoteClient: RemoteClient {
     }
 
     func download(_ item: RemoteItem, to localURL: URL) async throws {
+        try await download(item, to: localURL, progress: nil)
+    }
+
+    func download(_ item: RemoteItem, to localURL: URL, progress: TransferProgressHandler?) async throws {
         let request = try request(path: item.path, method: "GET")
+        let delegate = WebDAVAuthenticationDelegate(username: username, password: password, progress: progress)
+        let transferSession = URLSession(configuration: Self.sessionConfiguration(), delegate: delegate, delegateQueue: nil)
+        defer { transferSession.invalidateAndCancel() }
         do {
-            let (temporaryURL, response) = try await session.download(for: request)
+            let (temporaryURL, response) = try await transferSession.download(for: request)
             try validate(response, operation: "下载")
             try FileManager.default.createDirectory(at: localURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: localURL.path) {
@@ -76,10 +83,17 @@ actor WebDAVRemoteClient: RemoteClient {
     }
 
     func upload(_ localURL: URL, to directory: String) async throws {
+        try await upload(localURL, to: directory, progress: nil)
+    }
+
+    func upload(_ localURL: URL, to directory: String, progress: TransferProgressHandler?) async throws {
         let target = RemotePath.join(directory, localURL.lastPathComponent)
         let request = try request(path: target, method: "PUT")
+        let delegate = WebDAVAuthenticationDelegate(username: username, password: password, progress: progress)
+        let transferSession = URLSession(configuration: Self.sessionConfiguration(), delegate: delegate, delegateQueue: nil)
+        defer { transferSession.invalidateAndCancel() }
         do {
-            let (_, response) = try await session.upload(for: request, fromFile: localURL)
+            let (_, response) = try await transferSession.upload(for: request, fromFile: localURL)
             try validate(response, operation: "上传")
         } catch let error as CloudShelfError {
             throw error
@@ -114,6 +128,14 @@ actor WebDAVRemoteClient: RemoteClient {
         request.httpBody = body
         headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
         return request
+    }
+
+    private static func sessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 300
+        return configuration
     }
 
     private func execute(_ request: URLRequest, operation: String) async throws -> (Data, HTTPURLResponse) {
@@ -168,11 +190,13 @@ actor WebDAVRemoteClient: RemoteClient {
     }
 }
 
-private final class WebDAVAuthenticationDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+private final class WebDAVAuthenticationDelegate: NSObject, URLSessionTaskDelegate, URLSessionDownloadDelegate, @unchecked Sendable {
     private let credential: URLCredential
+    private let progress: TransferProgressHandler?
 
-    init(username: String, password: String) {
+    init(username: String, password: String, progress: TransferProgressHandler?) {
         credential = URLCredential(user: username, password: password, persistence: .forSession)
+        self.progress = progress
     }
 
     func urlSession(
@@ -188,4 +212,26 @@ private final class WebDAVAuthenticationDelegate: NSObject, URLSessionTaskDelega
             completionHandler(.performDefaultHandling, nil)
         }
     }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
+        progress?(totalBytesSent, totalBytesExpectedToSend > 0 ? totalBytesExpectedToSend : nil)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        progress?(totalBytesWritten, totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : nil)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) { }
 }

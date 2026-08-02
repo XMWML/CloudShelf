@@ -131,6 +131,7 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
     public var conflictPolicy: SyncConflictPolicy
     public var intervalMinutes: Int
     public var isEnabled: Bool
+    public var syncOnLocalChanges: Bool?
     public var lastSyncedAt: Date?
 
     public init(
@@ -141,6 +142,7 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
         conflictPolicy: SyncConflictPolicy = .keepNewest,
         intervalMinutes: Int = 15,
         isEnabled: Bool = true,
+        syncOnLocalChanges: Bool = false,
         lastSyncedAt: Date? = nil
     ) {
         self.id = id
@@ -150,6 +152,7 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
         self.conflictPolicy = conflictPolicy
         self.intervalMinutes = max(1, intervalMinutes)
         self.isEnabled = isEnabled
+        self.syncOnLocalChanges = syncOnLocalChanges
         self.lastSyncedAt = lastSyncedAt
     }
 }
@@ -176,6 +179,9 @@ public struct TransferTask: Identifiable, Sendable, Equatable {
     public var detail: String
     public var startedAt: Date?
     public var finishedAt: Date?
+    public var completedBytes: Int64
+    public var totalBytes: Int64?
+    public var bytesPerSecond: Double?
 
     public init(
         id: UUID = UUID(),
@@ -185,7 +191,10 @@ public struct TransferTask: Identifiable, Sendable, Equatable {
         status: TransferStatus = .queued,
         detail: String = "Waiting",
         startedAt: Date? = nil,
-        finishedAt: Date? = nil
+        finishedAt: Date? = nil,
+        completedBytes: Int64 = 0,
+        totalBytes: Int64? = nil,
+        bytesPerSecond: Double? = nil
     ) {
         self.id = id
         self.direction = direction
@@ -195,6 +204,9 @@ public struct TransferTask: Identifiable, Sendable, Equatable {
         self.detail = detail
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+        self.completedBytes = completedBytes
+        self.totalBytes = totalBytes
+        self.bytesPerSecond = bytesPerSecond
     }
 }
 

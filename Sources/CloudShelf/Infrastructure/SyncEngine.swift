@@ -13,14 +13,17 @@ public actor SyncEngine {
     public init() {}
 
     public func synchronize(rule: SyncRule, client: any RemoteClient) async throws -> SyncReport {
-        let localRoot = URL(fileURLWithPath: rule.localFolder, isDirectory: true)
+        let localRoot = URL(fileURLWithPath: rule.localFolder, isDirectory: true).resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: localRoot.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw CloudShelfError.invalidProfile("The selected local folder no longer exists.")
         }
 
+        try await ensureRemoteRoot(rule.remoteFolder, client: client)
         let localFiles = try localInventory(root: localRoot)
         let remoteItems = try await remoteInventory(client: client, root: rule.remoteFolder)
+        var knownRemoteDirectories = Set(remoteItems.values.filter(\.isDirectory).map(\.path))
+        knownRemoteDirectories.insert(RemotePath.normalized(rule.remoteFolder))
         var report = SyncReport()
 
         if rule.direction != .downloadOnly {
@@ -29,7 +32,12 @@ public actor SyncEngine {
                 let remotePath = RemotePath.join(rule.remoteFolder, relativePath)
                 let remote = remoteItems[remotePath]
                 if shouldUpload(local: local, remote: remote, rule: rule) {
-                    try await ensureRemoteDirectories(for: remotePath, root: rule.remoteFolder, client: client, existing: remoteItems)
+                    try await ensureRemoteDirectories(
+                        for: remotePath,
+                        root: rule.remoteFolder,
+                        client: client,
+                        knownDirectories: &knownRemoteDirectories
+                    )
                     try await client.upload(local.url, to: RemotePath.parent(of: remotePath))
                     report.uploaded += 1
                 } else {
@@ -67,9 +75,12 @@ public actor SyncEngine {
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]) else { return [:] }
         var output: [String: LocalItem] = [:]
         for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: keys)
-            let relative = url.path.replacingOccurrences(of: root.path + "/", with: "")
-            output[relative] = LocalItem(url: url, isDirectory: values.isDirectory == true, size: Int64(values.fileSize ?? 0), modifiedAt: values.contentModificationDate)
+            let resolvedURL = url.resolvingSymlinksInPath()
+            let values = try resolvedURL.resourceValues(forKeys: keys)
+            let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+            guard resolvedURL.path.hasPrefix(prefix) else { continue }
+            let relative = String(resolvedURL.path.dropFirst(prefix.count))
+            output[relative] = LocalItem(url: resolvedURL, isDirectory: values.isDirectory == true, size: Int64(values.fileSize ?? 0), modifiedAt: values.contentModificationDate)
         }
         return output
     }
@@ -90,7 +101,7 @@ public actor SyncEngine {
         for remotePath: String,
         root: String,
         client: any RemoteClient,
-        existing: [String: RemoteItem]
+        knownDirectories: inout Set<String>
     ) async throws {
         let directory = RemotePath.parent(of: remotePath)
         guard directory != root else { return }
@@ -99,8 +110,35 @@ public actor SyncEngine {
         let components = RemotePath.normalized(directory).split(separator: "/")
         for component in components.dropFirst(rootComponents) {
             let next = RemotePath.join(current, String(component))
-            if existing[next] == nil { try await client.createDirectory(named: String(component), in: current) }
+            if !knownDirectories.contains(next) {
+                try await createDirectoryIfNeeded(named: String(component), in: current, expectedPath: next, client: client)
+                knownDirectories.insert(next)
+            }
             current = next
+        }
+    }
+
+    private func ensureRemoteRoot(_ root: String, client: any RemoteClient) async throws {
+        let components = RemotePath.normalized(root).split(separator: "/")
+        var current = "/"
+        for component in components {
+            let next = RemotePath.join(current, String(component))
+            try await createDirectoryIfNeeded(named: String(component), in: current, expectedPath: next, client: client)
+            current = next
+        }
+    }
+
+    private func createDirectoryIfNeeded(
+        named name: String,
+        in parent: String,
+        expectedPath: String,
+        client: any RemoteClient
+    ) async throws {
+        do {
+            try await client.createDirectory(named: name, in: parent)
+        } catch {
+            let entries = try await client.list(at: parent)
+            guard entries.contains(where: { $0.path == expectedPath && $0.isDirectory }) else { throw error }
         }
     }
 

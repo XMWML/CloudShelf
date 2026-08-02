@@ -1,5 +1,6 @@
 import AppKit
 import CloudShelfCore
+import UniformTypeIdentifiers
 
 final class CloudShelfApplication: NSObject, NSApplicationDelegate {
     private var controller: FileManagerWindowController?
@@ -38,8 +39,26 @@ private enum BrowserRow: Equatable {
     }
 }
 
+private final class RemoteFilePromise: NSObject, @unchecked Sendable {
+    let item: RemoteItem
+    let client: any RemoteClient
+
+    init(item: RemoteItem, client: any RemoteClient) {
+        self.item = item
+        self.client = client
+    }
+}
+
+private final class FilePromiseCompletion: @unchecked Sendable {
+    private let handler: (Error?) -> Void
+
+    init(_ handler: @escaping (Error?) -> Void) { self.handler = handler }
+
+    func finish(_ error: Error?) { handler(error) }
+}
+
 @MainActor
-final class FileManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSToolbarDelegate {
+final class FileManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSToolbarDelegate, NSFilePromiseProviderDelegate {
     fileprivate let store = WorkspaceStore()
     fileprivate let connectionTable = NSTableView()
     fileprivate let browserTable = NSTableView()
@@ -60,6 +79,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private var displayedTransfers: [TransferTask] = []
     private var restoringConnectionSelection = false
     private var propertiesWindowController: RemoteItemPropertiesWindowController?
+    private var syncRulesWindowController: SyncRulesWindowController?
 
     init() {
         let window = NSWindow(
@@ -118,9 +138,11 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             }
         } else {
             let transfer = displayedTransfers[row]
+            if identifier == "progress" { return transferProgressCell(transfer) }
             switch identifier {
             case "transfer": text = transfer.title
             case "state": text = "\(transfer.connectionName) - \(transfer.detail)"
+            case "speed": text = transferSpeedDescription(transfer)
             default: text = ""
             }
             icon = identifier == "transfer" ? symbol(transfer.status == .failed ? "xmark.circle.fill" : transfer.status == .succeeded ? "checkmark.circle.fill" : "arrow.left.arrow.right") : nil
@@ -167,6 +189,50 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
         tableView === browserTable && session != nil ? .copy : []
+    }
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+        guard tableView === browserTable,
+              row >= 0,
+              row < browserRows.count,
+              let item = browserRows[row].item,
+              !item.isDirectory,
+              let session else { return nil }
+        let type = UTType(filenameExtension: item.fileExtension)?.identifier ?? UTType.data.identifier
+        let provider = NSFilePromiseProvider(fileType: type, delegate: self)
+        provider.userInfo = RemoteFilePromise(item: item, client: session.client)
+        return provider
+    }
+
+    func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+        (filePromiseProvider.userInfo as? RemoteFilePromise)?.item.name ?? "CloudShelf 下载"
+    }
+
+    func filePromiseProvider(
+        _ filePromiseProvider: NSFilePromiseProvider,
+        writePromiseTo url: URL,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        guard let promise = filePromiseProvider.userInfo as? RemoteFilePromise else {
+            completionHandler(CloudShelfError.commandFailed("无法读取待拖出的远端文件。"))
+            return
+        }
+        let completion = FilePromiseCompletion(completionHandler)
+        let item = promise.item
+        let client = promise.client
+        let destination = url.appendingPathComponent(item.name)
+        Task.detached {
+            do {
+                try await client.download(item, to: destination)
+                completion.finish(nil)
+            } catch {
+                completion.finish(error)
+            }
+        }
+    }
+
+    func operationQueue(for filePromiseProvider: NSFilePromiseProvider) -> OperationQueue {
+        OperationQueue.main
     }
 
     @objc func openSelectedItem() {
@@ -373,29 +439,40 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func moveItems() { moveOrCopy(isMove: true) }
 
     func configureSync() {
-        guard let profile = selectedProfile, let window else { return }
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "选择本地文件夹"
-        panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let local = panel.url?.path, let self else { return }
-            let form = SyncForm(localFolder: local)
-            self.presentForm(title: "自动同步", form: form, actionTitle: "添加规则") {
-                var changed = profile
-                changed.syncRules.append(form.rule())
-                Task { await self.store.save(profile: changed, secret: nil); self.refreshViews() }
-            }
+        guard let profile = selectedProfile, let session else {
+            presentError("请先连接服务器，再配置同步规则。")
+            return
         }
+        syncRulesWindowController?.close()
+        let controller = SyncRulesWindowController(
+            profile: profile,
+            session: session,
+            saveRules: { [weak self] rules in
+                guard let self else { return }
+                Task {
+                    await self.store.replaceSyncRules(rules, for: profile.id)
+                    self.refreshViews()
+                }
+            },
+            runRule: { [weak self] ruleID in
+                guard let self, let latest = self.store.profile(id: profile.id),
+                      let rule = latest.syncRules.first(where: { $0.id == ruleID }) else { return }
+                self.store.sync(profile: latest, rule: rule)
+            }
+        )
+        syncRulesWindowController = controller
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
     }
 
     func runSync() {
-        guard let profile = selectedProfile, let rule = profile.syncRules.first(where: { $0.isEnabled }) else {
+        guard let profile = selectedProfile else { return }
+        let rules = profile.syncRules.filter(\.isEnabled)
+        guard !rules.isEmpty else {
             configureSync()
             return
         }
-        store.sync(profile: profile, rule: rule)
+        rules.forEach { store.sync(profile: profile, rule: $0) }
     }
 
     private func moveOrCopy(isMove: Bool) {
@@ -798,6 +875,63 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         return view
     }
 
+    private func transferProgressCell(_ transfer: TransferTask) -> NSTableCellView {
+        let identifier = NSUserInterfaceItemIdentifier("transfer-progress")
+        let reusable = transferTable.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        if view.identifier == nil {
+            view.identifier = identifier
+            let progress = NSProgressIndicator()
+            progress.translatesAutoresizingMaskIntoConstraints = false
+            progress.style = .bar
+            progress.controlSize = .small
+            progress.identifier = NSUserInterfaceItemIdentifier("progress-indicator")
+            let label = NSTextField(labelWithString: "")
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.alignment = .right
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            label.identifier = NSUserInterfaceItemIdentifier("progress-label")
+            view.addSubview(progress)
+            view.addSubview(label)
+            NSLayoutConstraint.activate([
+                progress.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+                progress.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+                progress.trailingAnchor.constraint(equalTo: label.leadingAnchor, constant: -8),
+                label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+                label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+                label.widthAnchor.constraint(equalToConstant: 42)
+            ])
+        }
+
+        let progress = view.subviews.compactMap { $0 as? NSProgressIndicator }.first
+        let label = view.subviews.compactMap { $0 as? NSTextField }.first
+        if let total = transfer.totalBytes, total > 0 {
+            progress?.stopAnimation(nil)
+            progress?.isIndeterminate = false
+            progress?.minValue = 0
+            progress?.maxValue = Double(total)
+            progress?.doubleValue = Double(min(transfer.completedBytes, total))
+            label?.stringValue = "\(Int((Double(transfer.completedBytes) / Double(total)) * 100))%"
+        } else if transfer.status == .running {
+            progress?.isIndeterminate = true
+            progress?.startAnimation(nil)
+            label?.stringValue = "处理中"
+        } else {
+            progress?.stopAnimation(nil)
+            progress?.isIndeterminate = false
+            progress?.minValue = 0
+            progress?.maxValue = 1
+            progress?.doubleValue = transfer.status == .succeeded ? 1 : 0
+            label?.stringValue = transfer.status == .succeeded ? "完成" : "-"
+        }
+        return view
+    }
+
+    private func transferSpeedDescription(_ transfer: TransferTask) -> String {
+        guard let speed = transfer.bytesPerSecond, speed > 0 else { return "-" }
+        return "\(ByteCountFormatter.string(fromByteCount: Int64(speed), countStyle: .file))/秒"
+    }
+
     private func symbol(_ name: String) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: nil)
     }
@@ -1083,8 +1217,10 @@ private final class FileManagerViewController: NSViewController {
         owner.transferTable.dataSource = owner
         owner.transferTable.headerView = nil
         owner.transferTable.rowHeight = 27
-        owner.transferTable.addTableColumn(column("transfer", title: "任务", width: 245))
-        owner.transferTable.addTableColumn(column("state", title: "状态", width: 430))
+        owner.transferTable.addTableColumn(column("transfer", title: "任务", width: 185))
+        owner.transferTable.addTableColumn(column("state", title: "状态", width: 315))
+        owner.transferTable.addTableColumn(column("progress", title: "进度", width: 165))
+        owner.transferTable.addTableColumn(column("speed", title: "速率", width: 115))
         let stack = NSStackView(views: [top, browserScroll, transferTitle, transferScroll])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1302,56 +1438,491 @@ private final class ConnectionForm: NSView {
     }
 }
 
-private final class SyncForm: NSView {
-    private let local = NSTextField(string: "")
-    private let remote = NSTextField(string: "/")
-    private let direction = NSPopUpButton()
-    private let interval = NSPopUpButton()
-    private let directionTitles = ["仅上传本地变更", "仅下载远端变更", "保留较新版本"]
+@MainActor
+private final class SyncRulesWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let profile: ConnectionProfile
+    private let client: any RemoteClient
+    private let saveRules: ([SyncRule]) -> Void
+    private let runRule: (UUID) -> Void
+    private let table = NSTableView()
+    private var rules: [SyncRule]
+    private var ruleEditor: SyncRuleEditorWindowController?
 
-    init(localFolder: String) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 132))
-        local.stringValue = localFolder
-        local.isEditable = false
-        direction.addItems(withTitles: directionTitles)
-        interval.addItems(withTitles: ["5 分钟", "15 分钟", "30 分钟", "1 小时"])
-        interval.selectItem(at: 1)
-        layout(rows: [("本地文件夹", local), ("远端文件夹", remote), ("同步方向", direction), ("执行频率", interval)])
+    init(
+        profile: ConnectionProfile,
+        session: RemoteSession,
+        saveRules: @escaping ([SyncRule]) -> Void,
+        runRule: @escaping (UUID) -> Void
+    ) {
+        self.profile = profile
+        self.client = session.client
+        self.rules = profile.syncRules
+        self.saveRules = saveRules
+        self.runRule = runRule
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 470),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "同步管理 - \(profile.name)"
+        super.init(window: window)
+        window.contentView = makeContentView(window: window)
     }
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 440, height: 132) }
+    func numberOfRows(in tableView: NSTableView) -> Int { rules.count }
 
-    func rule() -> SyncRule {
-        let minutes = [5, 15, 30, 60][max(0, interval.indexOfSelectedItem)]
-        let syncDirection: SyncDirection
-        switch direction.indexOfSelectedItem {
-        case 1: syncDirection = .downloadOnly
-        case 2: syncDirection = .bidirectional
-        default: syncDirection = .uploadOnly
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0, row < rules.count else { return nil }
+        let rule = rules[row]
+        let identifier = tableColumn?.identifier.rawValue ?? ""
+        let text: String
+        switch identifier {
+        case "local": text = rule.localFolder
+        case "remote": text = rule.remoteFolder
+        case "direction": text = directionText(rule.direction)
+        case "schedule":
+            let changeMode = rule.syncOnLocalChanges == true ? "变更后自动" : ""
+            text = changeMode.isEmpty ? "每 \(rule.intervalMinutes) 分钟" : "\(changeMode) + 每 \(rule.intervalMinutes) 分钟"
+        case "state": text = rule.isEnabled ? "已启用" : "已停用"
+        case "last": text = rule.lastSyncedAt?.formatted(date: .abbreviated, time: .shortened) ?? "从未"
+        default: text = ""
         }
-        return SyncRule(localFolder: local.stringValue, remoteFolder: remote.stringValue, direction: syncDirection, intervalMinutes: minutes)
+        return textCell(identifier: NSUserInterfaceItemIdentifier("sync-\(identifier)"), text: text)
     }
 
-    private func layout(rows: [(String, NSView)]) {
-        let views = rows.map { label, field -> [NSView] in
-            let text = NSTextField(labelWithString: label)
-            text.alignment = .right
-            return [text, field]
+    func tableViewSelectionDidChange(_ notification: Notification) { }
+
+    @objc private func addRule() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择本地文件夹"
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let localFolder = panel.url?.path, let self else { return }
+            self.openRuleEditor(localFolder: localFolder, existing: nil, index: nil)
         }
-        let grid = NSGridView(views: views)
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        grid.rowSpacing = 8
-        grid.columnSpacing = 10
+    }
+
+    @objc private func editRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count else { return }
+        openRuleEditor(localFolder: rules[row].localFolder, existing: rules[row], index: row)
+    }
+
+    @objc private func removeRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count else { return }
+        rules.remove(at: row)
+        persistRules()
+        table.reloadData()
+    }
+
+    @objc private func toggleRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count else { return }
+        rules[row].isEnabled.toggle()
+        persistRules()
+        table.reloadData()
+    }
+
+    @objc private func runSelectedRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count, rules[row].isEnabled else { return }
+        runRule(rules[row].id)
+    }
+
+    private func openRuleEditor(localFolder: String, existing: SyncRule?, index: Int?) {
+        ruleEditor?.close()
+        let editor = SyncRuleEditorWindowController(
+            localFolder: localFolder,
+            existing: existing,
+            client: client,
+            saveRule: { [weak self] rule in
+                guard let self else { return }
+                if let index { self.rules[index] = rule } else { self.rules.append(rule) }
+                self.persistRules()
+                self.table.reloadData()
+            }
+        )
+        ruleEditor = editor
+        editor.showWindow(nil)
+        editor.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func persistRules() { saveRules(rules) }
+
+    private func makeContentView(window: NSWindow) -> NSView {
+        table.delegate = self
+        table.dataSource = self
+        table.rowHeight = 30
+        table.addTableColumn(column("local", title: "本地文件夹", width: 210))
+        table.addTableColumn(column("remote", title: "远端文件夹", width: 135))
+        table.addTableColumn(column("direction", title: "方向", width: 110))
+        table.addTableColumn(column("schedule", title: "执行方式", width: 155))
+        table.addTableColumn(column("state", title: "状态", width: 70))
+        table.addTableColumn(column("last", title: "上次同步", width: 120))
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = table
+
+        let add = NSButton(title: "添加规则", target: self, action: #selector(addRule))
+        let edit = NSButton(title: "编辑", target: self, action: #selector(editRule))
+        let remove = NSButton(title: "移除", target: self, action: #selector(removeRule))
+        let toggle = NSButton(title: "启用/停用", target: self, action: #selector(toggleRule))
+        let run = NSButton(title: "立即执行", target: self, action: #selector(runSelectedRule))
+        let close = NSButton(title: "完成", target: window, action: #selector(NSWindow.performClose(_:)))
+        [add, edit, remove, toggle, run, close].forEach { $0.bezelStyle = .rounded }
+        let controls = NSStackView(views: [add, edit, remove, toggle, run, NSView(), close])
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 8
+        controls.arrangedSubviews[5].setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let stack = NSStackView(views: [scroll, controls])
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let root = NSView()
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            controls.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+        return root
+    }
+
+    private func column(_ id: String, title: String, width: CGFloat) -> NSTableColumn {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+        column.title = title
+        column.width = width
+        column.minWidth = 60
+        return column
+    }
+
+    private func textCell(identifier: NSUserInterfaceItemIdentifier, text: String) -> NSTableCellView {
+        let reusable = table.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        if view.identifier == nil {
+            view.identifier = identifier
+            let textField = NSTextField(labelWithString: "")
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            textField.lineBreakMode = .byTruncatingMiddle
+            view.textField = textField
+            view.addSubview(textField)
+            NSLayoutConstraint.activate([
+                textField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+                textField.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+                textField.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            ])
+        }
+        view.textField?.stringValue = text
+        return view
+    }
+
+    private func directionText(_ direction: SyncDirection) -> String {
+        switch direction {
+        case .uploadOnly: return "仅上传"
+        case .downloadOnly: return "仅下载"
+        case .bidirectional: return "保留较新版本"
+        }
+    }
+}
+
+@MainActor
+private final class SyncRuleEditorWindowController: NSWindowController {
+    private let localFolder: String
+    private let existing: SyncRule?
+    private let client: any RemoteClient
+    private let saveRule: (SyncRule) -> Void
+    private let remote = NSTextField(string: "/")
+    private let direction = NSPopUpButton()
+    private let interval = NSPopUpButton()
+    private let watchChanges = NSButton(checkboxWithTitle: "检测到本地文件夹变化后自动同步", target: nil, action: nil)
+    private var folderPicker: RemoteFolderPickerWindowController?
+
+    init(localFolder: String, existing: SyncRule?, client: any RemoteClient, saveRule: @escaping (SyncRule) -> Void) {
+        self.localFolder = localFolder
+        self.existing = existing
+        self.client = client
+        self.saveRule = saveRule
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 250),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = existing == nil ? "添加同步规则" : "编辑同步规则"
+        super.init(window: window)
+        direction.addItems(withTitles: ["仅上传本地变更", "仅下载远端变更", "保留较新版本"])
+        interval.addItems(withTitles: ["5 分钟", "15 分钟", "30 分钟", "1 小时"])
+        applyExistingRule()
+        window.contentView = makeContentView(window: window)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    @objc private func chooseRemoteFolder() {
+        folderPicker?.close()
+        let picker = RemoteFolderPickerWindowController(client: client, initialPath: remote.stringValue) { [weak self] path in
+            self?.remote.stringValue = path
+        }
+        folderPicker = picker
+        picker.showWindow(nil)
+        picker.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func save() {
+        let local = localFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remoteFolder = remote.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !local.isEmpty, !remoteFolder.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "请填写本地和远端文件夹。"
+            alert.beginSheetModal(for: window!) { _ in }
+            return
+        }
+        let directionValue: SyncDirection
+        switch direction.indexOfSelectedItem {
+        case 1: directionValue = .downloadOnly
+        case 2: directionValue = .bidirectional
+        default: directionValue = .uploadOnly
+        }
+        let minutes = [5, 15, 30, 60][max(0, interval.indexOfSelectedItem)]
+        let rule = SyncRule(
+            id: existing?.id ?? UUID(),
+            localFolder: local,
+            remoteFolder: remoteFolder,
+            direction: directionValue,
+            conflictPolicy: existing?.conflictPolicy ?? .keepNewest,
+            intervalMinutes: minutes,
+            isEnabled: existing?.isEnabled ?? true,
+            syncOnLocalChanges: watchChanges.state == .on,
+            lastSyncedAt: existing?.lastSyncedAt
+        )
+        saveRule(rule)
+        close()
+    }
+
+    private func applyExistingRule() {
+        guard let existing else {
+            interval.selectItem(at: 1)
+            return
+        }
+        remote.stringValue = existing.remoteFolder
+        switch existing.direction {
+        case .uploadOnly: direction.selectItem(at: 0)
+        case .downloadOnly: direction.selectItem(at: 1)
+        case .bidirectional: direction.selectItem(at: 2)
+        }
+        let intervalIndex = [5, 15, 30, 60].firstIndex(of: existing.intervalMinutes) ?? 1
+        interval.selectItem(at: intervalIndex)
+        watchChanges.state = existing.syncOnLocalChanges == true ? .on : .off
+    }
+
+    private func makeContentView(window: NSWindow) -> NSView {
+        let local = NSTextField(labelWithString: localFolder)
+        local.lineBreakMode = .byTruncatingMiddle
+        let remotePicker = NSButton(title: "选择…", target: self, action: #selector(chooseRemoteFolder))
+        remotePicker.bezelStyle = .rounded
+        let remoteRow = NSStackView(views: [remote, remotePicker])
+        remoteRow.orientation = .horizontal
+        remoteRow.spacing = 8
+        let fields: [(String, NSView)] = [
+            ("本地文件夹", local),
+            ("远端文件夹", remoteRow),
+            ("同步方向", direction),
+            ("执行频率", interval),
+            ("自动同步", watchChanges)
+        ]
+        let grid = NSGridView(views: fields.map { label, field in
+            let labelField = NSTextField(labelWithString: label)
+            labelField.alignment = .right
+            return [labelField, field]
+        })
+        grid.rowSpacing = 10
+        grid.columnSpacing = 12
         grid.xPlacement = .fill
         grid.yPlacement = .center
-        grid.column(at: 0).width = 110
-        grid.column(at: 1).width = 300
-        addSubview(grid)
+        grid.column(at: 0).width = 95
+        grid.column(at: 1).width = 360
+
+        let save = NSButton(title: "保存", target: self, action: #selector(save))
+        save.bezelStyle = .rounded
+        let cancel = NSButton(title: "取消", target: window, action: #selector(NSWindow.performClose(_:)))
+        cancel.bezelStyle = .rounded
+        let actions = NSStackView(views: [NSView(), cancel, save])
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        actions.arrangedSubviews[0].setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let stack = NSStackView(views: [grid, actions])
+        stack.orientation = .vertical
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let root = NSView()
+        root.addSubview(stack)
         NSLayoutConstraint.activate([
-            grid.leadingAnchor.constraint(equalTo: leadingAnchor), grid.trailingAnchor.constraint(equalTo: trailingAnchor),
-            grid.topAnchor.constraint(equalTo: topAnchor), grid.bottomAnchor.constraint(equalTo: bottomAnchor)
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+            grid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            actions.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
+        return root
+    }
+}
+
+@MainActor
+private final class RemoteFolderPickerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let client: any RemoteClient
+    private let chooseFolder: (String) -> Void
+    private let table = NSTableView()
+    private let pathLabel = NSTextField(labelWithString: "/")
+    private let statusLabel = NSTextField(labelWithString: "")
+    private var location: String
+    private var items: [RemoteItem] = []
+
+    init(client: any RemoteClient, initialPath: String, chooseFolder: @escaping (String) -> Void) {
+        self.client = client
+        self.location = RemotePath.normalized(initialPath)
+        self.chooseFolder = chooseFolder
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 550, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "选择远端文件夹"
+        super.init(window: window)
+        window.contentView = makeContentView(window: window)
+        reload()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0, row < items.count else { return nil }
+        let item = items[row]
+        let identifier = tableColumn?.identifier.rawValue ?? ""
+        let text = identifier == "modified" ? (item.modifiedAt?.formatted(date: .abbreviated, time: .shortened) ?? "-") : item.name
+        let reusable = table.makeView(withIdentifier: NSUserInterfaceItemIdentifier("picker-\(identifier)"), owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        if view.identifier == nil {
+            view.identifier = NSUserInterfaceItemIdentifier("picker-\(identifier)")
+            let label = NSTextField(labelWithString: "")
+            label.translatesAutoresizingMaskIntoConstraints = false
+            view.textField = label
+            view.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+                label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+                label.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            ])
+        }
+        view.textField?.stringValue = text
+        return view
+    }
+
+    @objc private func openSelectedFolder() {
+        let row = table.selectedRow
+        guard row >= 0, row < items.count else { return }
+        location = items[row].path
+        reload()
+    }
+
+    @objc private func goUp() {
+        guard location != "/" else { return }
+        location = RemotePath.parent(of: location)
+        reload()
+    }
+
+    @objc private func reload() {
+        pathLabel.stringValue = location
+        statusLabel.stringValue = "正在加载…"
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                self.items = try await self.client.list(at: self.location).filter(\.isDirectory)
+                self.statusLabel.stringValue = "\(self.items.count) 个文件夹"
+            } catch {
+                self.items = []
+                self.statusLabel.stringValue = "加载失败：\(error.localizedDescription)"
+            }
+            self.table.reloadData()
+        }
+    }
+
+    @objc private func chooseCurrentFolder() {
+        chooseFolder(location)
+        close()
+    }
+
+    private func makeContentView(window: NSWindow) -> NSView {
+        pathLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        pathLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.textColor = .secondaryLabelColor
+        let up = NSButton(title: "上级", target: self, action: #selector(goUp))
+        let refresh = NSButton(title: "刷新", target: self, action: #selector(reload))
+        let choose = NSButton(title: "选择此文件夹", target: self, action: #selector(chooseCurrentFolder))
+        let cancel = NSButton(title: "取消", target: window, action: #selector(NSWindow.performClose(_:)))
+        [up, refresh, choose, cancel].forEach { $0.bezelStyle = .rounded }
+        let top = NSStackView(views: [pathLabel, NSView(), up, refresh])
+        top.orientation = .horizontal
+        top.alignment = .centerY
+        top.spacing = 8
+        top.arrangedSubviews[1].setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        table.delegate = self
+        table.dataSource = self
+        table.rowHeight = 28
+        table.target = self
+        table.doubleAction = #selector(openSelectedFolder)
+        let name = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        name.title = "文件夹"
+        name.width = 345
+        let modified = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("modified"))
+        modified.title = "修改时间"
+        modified.width = 155
+        table.addTableColumn(name)
+        table.addTableColumn(modified)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = table
+
+        let bottom = NSStackView(views: [statusLabel, NSView(), cancel, choose])
+        bottom.orientation = .horizontal
+        bottom.alignment = .centerY
+        bottom.spacing = 8
+        bottom.arrangedSubviews[1].setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let stack = NSStackView(views: [top, scroll, bottom])
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let root = NSView()
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+            top.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            bottom.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+        return root
     }
 }

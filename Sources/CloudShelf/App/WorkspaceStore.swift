@@ -88,6 +88,7 @@ private struct FolderUploadPlan: Sendable {
     struct File: Sendable {
         let url: URL
         let remotePath: String
+        let size: Int64
     }
 
     let directories: [String]
@@ -95,7 +96,7 @@ private struct FolderUploadPlan: Sendable {
     let skippedItems: Int
 
     static func make(source: URL, remoteParent: String) throws -> FolderUploadPlan {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
         let root = source.standardizedFileURL
         let rootValues = try root.resourceValues(forKeys: keys)
         guard rootValues.isDirectory == true else {
@@ -129,7 +130,7 @@ private struct FolderUploadPlan: Sendable {
             } else if values.isDirectory == true {
                 directories.append(remotePath)
             } else if values.isRegularFile == true {
-                files.append(File(url: child, remotePath: remotePath))
+                files.append(File(url: child, remotePath: remotePath, size: Int64(values.fileSize ?? 0)))
             } else {
                 skippedItems += 1
             }
@@ -147,6 +148,49 @@ private struct FolderUploadPlan: Sendable {
     }
 }
 
+private struct LocalFolderFingerprint: Sendable, Equatable {
+    let itemCount: Int
+    let totalBytes: Int64
+    let signature: UInt64
+
+    static func make(folder: String) throws -> LocalFolderFingerprint {
+        let root = URL(fileURLWithPath: folder, isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CloudShelfError.invalidProfile("本地同步文件夹不存在。")
+        }
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: Array(keys),
+            options: []
+        ) else {
+            throw CloudShelfError.commandFailed("无法检查本地同步文件夹。")
+        }
+
+        var itemCount = 0
+        var totalBytes: Int64 = 0
+        var signature: UInt64 = 0
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: keys)
+            let relativePath = String(url.path.dropFirst(root.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let size = Int64(values.fileSize ?? 0)
+            let modified = Int64((values.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1_000)
+            let kind = values.isDirectory == true ? "d" : "f"
+            signature ^= stableHash("\(relativePath)|\(kind)|\(size)|\(modified)")
+            itemCount += 1
+            if values.isDirectory != true { totalBytes += size }
+        }
+        return LocalFolderFingerprint(itemCount: itemCount, totalBytes: totalBytes, signature: signature)
+    }
+
+    private static func stableHash(_ value: String) -> UInt64 {
+        value.utf8.reduce(UInt64(1_469_598_103_934_665_603)) { hash, byte in
+            (hash ^ UInt64(byte)) &* 1_099_511_628_211
+        }
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published private(set) var profiles: [ConnectionProfile] = []
@@ -158,13 +202,16 @@ final class WorkspaceStore: ObservableObject {
     private let syncEngine = SyncEngine()
     private var syncTimer: Timer?
     private var syncingRuleIDs = Set<UUID>()
+    private var localFingerprints: [UUID: LocalFolderFingerprint] = [:]
+    private var fingerprintingRuleIDs = Set<UUID>()
+    private var pendingChangeSyncs: [UUID: Date] = [:]
 
     init() {
         Task {
             profiles = await profileStore.load().sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
-        syncTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.runDueSyncs() }
+        syncTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.runScheduledSyncs() }
         }
     }
 
@@ -189,10 +236,24 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    func replaceSyncRules(_ rules: [SyncRule], for profileID: UUID) async {
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
+        let previousRuleIDs = Set(profiles[index].syncRules.map(\.id))
+        let updatedRuleIDs = Set(rules.map(\.id))
+        profiles[index].syncRules = rules
+        for ruleID in previousRuleIDs.subtracting(updatedRuleIDs) { clearChangeTracking(for: ruleID) }
+        do {
+            try await profileStore.save(profiles)
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
     func delete(profile: ConnectionProfile) async {
         sessions.removeValue(forKey: profile.id)
         profiles.removeAll { $0.id == profile.id }
         CredentialStore.delete(profileID: profile.id)
+        profile.syncRules.forEach { clearChangeTracking(for: $0.id) }
         do { try await profileStore.save(profiles) } catch { lastError = error.localizedDescription }
     }
 
@@ -265,6 +326,7 @@ final class WorkspaceStore: ObservableObject {
                 let report = try await syncEngine.synchronize(rule: rule, client: session.client)
                 updateTransfer(transfer.id, status: .succeeded, detail: "已上传 \(report.uploaded) 项，已下载 \(report.downloaded) 项", finishedAt: .now)
                 markSynced(ruleID: rule.id, profileID: profile.id)
+                clearChangeTracking(for: rule.id)
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
                 lastError = error.localizedDescription
@@ -274,29 +336,43 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func enqueueUpload(_ url: URL, session: RemoteSession) {
-        let transfer = TransferTask(direction: .upload, title: url.lastPathComponent, connectionName: session.profile.name)
         let destination = session.location
+        let transfer = TransferTask(direction: .upload, title: url.lastPathComponent, connectionName: session.profile.name)
         transfers.append(transfer)
         Task {
             do {
-                let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
                 if values.isDirectory == true {
                     updateTransfer(transfer.id, status: .running, detail: "正在准备文件夹", startedAt: .now)
                     let plan = try await Task.detached(priority: .userInitiated) {
                         try FolderUploadPlan.make(source: url, remoteParent: destination)
                     }.value
+                    setTransferTotal(transfer.id, bytes: plan.files.reduce(0) { $0 + $1.size })
                     try await upload(folder: plan, client: session.client, transferID: transfer.id)
                     let skipped = plan.skippedItems == 0 ? "" : "，跳过 \(plan.skippedItems) 项"
                     updateTransfer(
                         transfer.id,
                         status: .succeeded,
                         detail: "已上传 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹\(skipped)",
-                        finishedAt: .now
+                        finishedAt: .now,
+                        completedBytes: plan.files.reduce(0) { $0 + $1.size }
                     )
                 } else {
+                    let size = Int64(values.fileSize ?? 0)
+                    setTransferTotal(transfer.id, bytes: size)
                     updateTransfer(transfer.id, status: .running, detail: "正在上传", startedAt: .now)
-                    try await session.client.upload(url, to: destination)
-                    updateTransfer(transfer.id, status: .succeeded, detail: "上传完成", finishedAt: .now)
+                    try await session.client.upload(
+                        url,
+                        to: destination,
+                        progress: transferProgressHandler(for: transfer.id, totalBytes: size)
+                    )
+                    updateTransfer(
+                        transfer.id,
+                        status: .succeeded,
+                        detail: "上传完成",
+                        finishedAt: .now,
+                        completedBytes: size
+                    )
                 }
                 await session.reload()
             } catch {
@@ -320,13 +396,26 @@ final class WorkspaceStore: ObservableObject {
             try await ensureRemoteDirectory(path, client: client)
         }
 
+        let totalBytes = plan.files.reduce(0) { $0 + $1.size }
+        var completedBytes: Int64 = 0
         for (index, file) in plan.files.enumerated() {
             updateTransfer(
                 transferID,
                 status: .running,
                 detail: "正在上传文件 \(index + 1)/\(plan.files.count)"
             )
-            try await client.upload(file.url, to: RemotePath.parent(of: file.remotePath))
+            try await client.upload(
+                file.url,
+                to: RemotePath.parent(of: file.remotePath),
+                progress: transferProgressHandler(for: transferID, offset: completedBytes, totalBytes: totalBytes)
+            )
+            completedBytes += file.size
+            updateTransfer(
+                transferID,
+                status: .running,
+                detail: "正在上传文件 \(index + 1)/\(plan.files.count)",
+                completedBytes: completedBytes
+            )
         }
     }
 
@@ -342,13 +431,28 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func enqueueDownload(_ item: RemoteItem, directory: URL, session: RemoteSession) {
-        let transfer = TransferTask(direction: .download, title: item.name, connectionName: session.profile.name)
+        let transfer = TransferTask(
+            direction: .download,
+            title: item.name,
+            connectionName: session.profile.name,
+            totalBytes: item.size
+        )
         transfers.append(transfer)
         Task {
             updateTransfer(transfer.id, status: .running, detail: "正在下载", startedAt: .now)
             do {
-                try await session.client.download(item, to: directory.appendingPathComponent(item.name))
-                updateTransfer(transfer.id, status: .succeeded, detail: "下载完成", finishedAt: .now)
+                try await session.client.download(
+                    item,
+                    to: directory.appendingPathComponent(item.name),
+                    progress: transferProgressHandler(for: transfer.id, totalBytes: item.size)
+                )
+                updateTransfer(
+                    transfer.id,
+                    status: .succeeded,
+                    detail: "下载完成",
+                    finishedAt: .now,
+                    completedBytes: item.size ?? 0
+                )
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
                 lastError = error.localizedDescription
@@ -388,12 +492,56 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func updateTransfer(_ id: UUID, status: TransferStatus, detail: String, startedAt: Date? = nil, finishedAt: Date? = nil) {
+    private func setTransferTotal(_ id: UUID, bytes: Int64) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        transfers[index].totalBytes = bytes
+    }
+
+    private func transferProgressHandler(
+        for transferID: UUID,
+        offset: Int64 = 0,
+        totalBytes: Int64?
+    ) -> TransferProgressHandler {
+        { [weak self] completedBytes, reportedTotalBytes in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let total = totalBytes ?? reportedTotalBytes.map { offset + $0 }
+                self.recordTransferProgress(transferID, completedBytes: offset + completedBytes, totalBytes: total)
+            }
+        }
+    }
+
+    private func recordTransferProgress(_ id: UUID, completedBytes: Int64, totalBytes: Int64?) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        updateTransfer(
+            id,
+            status: transfers[index].status,
+            detail: transfers[index].detail,
+            completedBytes: completedBytes,
+            totalBytes: totalBytes
+        )
+    }
+
+    private func updateTransfer(
+        _ id: UUID,
+        status: TransferStatus,
+        detail: String,
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        completedBytes: Int64? = nil,
+        totalBytes: Int64? = nil
+    ) {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
         transfers[index].status = status
         transfers[index].detail = detail
         if let startedAt { transfers[index].startedAt = startedAt }
         if let finishedAt { transfers[index].finishedAt = finishedAt }
+        if let completedBytes { transfers[index].completedBytes = completedBytes }
+        if let totalBytes { transfers[index].totalBytes = totalBytes }
+        let elapsed = (finishedAt ?? .now).timeIntervalSince(transfers[index].startedAt ?? .now)
+        if transfers[index].completedBytes > 0, elapsed > 0 {
+            transfers[index].bytesPerSecond = Double(transfers[index].completedBytes) / elapsed
+        }
     }
 
     private func markSynced(ruleID: UUID, profileID: UUID) {
@@ -402,13 +550,43 @@ final class WorkspaceStore: ObservableObject {
         Task { try? await profileStore.save(profiles) }
     }
 
-    private func runDueSyncs() {
+    private func runScheduledSyncs() {
         let now = Date.now
+        detectLocalFolderChanges()
         for profile in profiles where sessions[profile.id] != nil {
             for rule in profile.syncRules where rule.isEnabled {
+                if let requestedAt = pendingChangeSyncs[rule.id], requestedAt <= now {
+                    pendingChangeSyncs.removeValue(forKey: rule.id)
+                    sync(profile: profile, rule: rule)
+                }
                 let dueDate = rule.lastSyncedAt?.addingTimeInterval(Double(rule.intervalMinutes * 60)) ?? .distantPast
                 if now >= dueDate { sync(profile: profile, rule: rule) }
             }
         }
+    }
+
+    private func detectLocalFolderChanges() {
+        for profile in profiles where sessions[profile.id] != nil {
+            for rule in profile.syncRules where rule.isEnabled && rule.syncOnLocalChanges == true && rule.direction != .downloadOnly {
+                guard fingerprintingRuleIDs.insert(rule.id).inserted else { continue }
+                Task { [weak self] in
+                    let fingerprint = try? await Task.detached(priority: .utility) {
+                        try LocalFolderFingerprint.make(folder: rule.localFolder)
+                    }.value
+                    guard let self else { return }
+                    self.fingerprintingRuleIDs.remove(rule.id)
+                    guard let fingerprint else { return }
+                    if let previous = self.localFingerprints[rule.id], previous != fingerprint {
+                        self.pendingChangeSyncs[rule.id] = .now.addingTimeInterval(2)
+                    }
+                    self.localFingerprints[rule.id] = fingerprint
+                }
+            }
+        }
+    }
+
+    private func clearChangeTracking(for ruleID: UUID) {
+        localFingerprints.removeValue(forKey: ruleID)
+        pendingChangeSyncs.removeValue(forKey: ruleID)
     }
 }
