@@ -21,6 +21,23 @@ private enum RemoteClipboardOperation {
     case move
 }
 
+private enum BrowserRow: Equatable {
+    case parentDirectory
+    case item(RemoteItem)
+
+    var identifier: String {
+        switch self {
+        case .parentDirectory: return "__cloudshelf_parent_directory__"
+        case .item(let item): return item.path
+        }
+    }
+
+    var item: RemoteItem? {
+        guard case .item(let item) = self else { return nil }
+        return item
+    }
+}
+
 @MainActor
 final class FileManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSToolbarDelegate {
     fileprivate let store = WorkspaceStore()
@@ -39,8 +56,9 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private var lastSessionError: String?
     private var displayedProfiles: [ConnectionProfile] = []
     private var displayedSessionID: UUID?
-    private var displayedItems: [RemoteItem] = []
+    private var displayedRows: [BrowserRow] = []
     private var restoringConnectionSelection = false
+    private var propertiesWindowController: RemoteItemPropertiesWindowController?
 
     init() {
         let window = NSWindow(
@@ -62,7 +80,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         if tableView === connectionTable { return store.profiles.count }
-        if tableView === browserTable { return session?.items.count ?? 0 }
+        if tableView === browserTable { return browserRows.count }
         return min(8, store.transfers.count)
     }
 
@@ -78,15 +96,25 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             default: text = ""
             }
             icon = symbol(profile.protocolType == .sftp ? "lock.shield" : "externaldrive.connected.to.line.below")
-        } else if tableView === browserTable, let item = session?.items[row] {
-            switch identifier {
-            case "name": text = item.name
-            case "modified": text = item.modifiedAt?.formatted(date: .abbreviated, time: .shortened) ?? "-"
-            case "size": text = item.isDirectory ? "-" : item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "-"
-            case "type": text = item.isDirectory ? "文件夹" : (item.fileExtension.isEmpty ? "文件" : item.fileExtension.uppercased())
-            default: text = ""
+        } else if tableView === browserTable, row >= 0, row < browserRows.count {
+            switch browserRows[row] {
+            case .parentDirectory:
+                switch identifier {
+                case "name": text = ".."
+                case "type": text = "上级目录"
+                default: text = "-"
+                }
+                icon = identifier == "name" ? symbol("arrow.uturn.up") : nil
+            case .item(let item):
+                switch identifier {
+                case "name": text = item.name
+                case "modified": text = item.modifiedAt?.formatted(date: .abbreviated, time: .shortened) ?? "-"
+                case "size": text = item.isDirectory ? "-" : item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "-"
+                case "type": text = item.isDirectory ? "文件夹" : (item.fileExtension.isEmpty ? "文件" : item.fileExtension.uppercased())
+                default: text = ""
+                }
+                icon = identifier == "name" ? symbol(item.isDirectory ? "folder.fill" : "doc") : nil
             }
-            icon = identifier == "name" ? symbol(item.isDirectory ? "folder.fill" : "doc") : nil
         } else {
             let transfer = Array(store.transfers.suffix(8).reversed())[row]
             switch identifier {
@@ -116,6 +144,18 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { true }
 
+    func tableView(_ tableView: NSTableView, menuFor event: NSEvent) -> NSMenu? {
+        let point = tableView.convert(event.locationInWindow, from: nil)
+        let row = tableView.row(at: point)
+        if row >= 0, !tableView.selectedRowIndexes.contains(row) {
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+
+        if tableView === browserTable { return browserContextMenu() }
+        if tableView === connectionTable { return connectionContextMenu() }
+        return nil
+    }
+
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
         guard tableView === browserTable,
               let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL],
@@ -129,9 +169,16 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     @objc func openSelectedItem() {
-        guard let item = selectedItems.first, item.isDirectory, let session else { return }
+        guard selectedBrowserRows.count == 1, let row = selectedBrowserRows.first, let session else { return }
         Task { [weak self] in
-            await session.open(item)
+            switch row {
+            case .parentDirectory:
+                await session.goUp()
+            case .item(let item) where item.isDirectory:
+                await session.open(item)
+            case .item:
+                return
+            }
             self?.refreshViews()
         }
     }
@@ -164,13 +211,13 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     private func reloadBrowserTableIfNeeded() {
         let currentSessionID = session?.id
-        let currentItems = session?.items ?? []
-        guard displayedSessionID != currentSessionID || displayedItems != currentItems else { return }
-        let selectedPaths = displayedSessionID == currentSessionID ? selectedItems.map(\.path) : []
+        let currentRows = browserRows
+        guard displayedSessionID != currentSessionID || displayedRows != currentRows else { return }
+        let selectedIdentifiers = displayedSessionID == currentSessionID ? selectedBrowserRows.map(\.identifier) : []
         displayedSessionID = currentSessionID
-        displayedItems = currentItems
+        displayedRows = currentRows
         browserTable.reloadData()
-        let selectedRows = IndexSet(currentItems.indices.filter { selectedPaths.contains(currentItems[$0].path) })
+        let selectedRows = IndexSet(currentRows.indices.filter { selectedIdentifiers.contains(currentRows[$0].identifier) })
         browserTable.selectRowIndexes(selectedRows, byExtendingSelection: false)
     }
 
@@ -357,12 +404,78 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         selectedProfileID.flatMap { store.profile(id: $0) }
     }
 
-    private var selectedItems: [RemoteItem] {
+    private var browserRows: [BrowserRow] {
         guard let session else { return [] }
-        return browserTable.selectedRowIndexes.compactMap { index in
-            guard index >= 0, index < session.items.count else { return nil }
-            return session.items[index]
+        let items = session.items.map(BrowserRow.item)
+        return session.location == "/" ? items : [.parentDirectory] + items
+    }
+
+    private var selectedBrowserRows: [BrowserRow] {
+        browserTable.selectedRowIndexes.compactMap { index in
+            guard index >= 0, index < browserRows.count else { return nil }
+            return browserRows[index]
         }
+    }
+
+    private var selectedItems: [RemoteItem] {
+        selectedBrowserRows.compactMap(\.item)
+    }
+
+    private func browserContextMenu() -> NSMenu {
+        let menu = NSMenu(title: "文件")
+        let hasParentRow = selectedBrowserRows.contains(.parentDirectory)
+        let items = selectedItems
+        let hasItems = !items.isEmpty
+        let canOpen = items.count == 1 && items[0].isDirectory
+        let canShowProperties = items.count == 1
+
+        if hasParentRow {
+            menu.addItem(contextMenuItem("返回上级目录", #selector(openSelectedItem), enabled: true))
+            menu.addItem(.separator())
+            menu.addItem(contextMenuItem("刷新", #selector(reloadAction), enabled: session != nil))
+            return menu
+        }
+
+        menu.addItem(contextMenuItem("打开", #selector(openSelectedItem), enabled: canOpen))
+        menu.addItem(contextMenuItem("下载", #selector(downloadAction), enabled: hasItems))
+        menu.addItem(.separator())
+        menu.addItem(contextMenuItem("剪切", #selector(cutSelectionAction), key: "x", enabled: hasItems))
+        menu.addItem(contextMenuItem("复制", #selector(copySelectionAction), key: "c", enabled: hasItems))
+        menu.addItem(contextMenuItem("粘贴", #selector(pasteSelectionAction), key: "v", enabled: session != nil && !clipboardItems.isEmpty))
+        menu.addItem(.separator())
+        menu.addItem(contextMenuItem("重命名", #selector(renameAction), enabled: items.count == 1))
+        menu.addItem(contextMenuItem("复制到指定文件夹", #selector(copyAction), enabled: hasItems))
+        menu.addItem(contextMenuItem("移动到指定文件夹", #selector(moveAction), enabled: hasItems))
+        menu.addItem(contextMenuItem("删除", #selector(deleteAction), key: "\u{8}", enabled: hasItems))
+        menu.addItem(.separator())
+        menu.addItem(contextMenuItem("属性", #selector(propertiesAction), key: "i", enabled: canShowProperties))
+        return menu
+    }
+
+    private func connectionContextMenu() -> NSMenu {
+        let menu = NSMenu(title: "连接")
+        let hasProfile = selectedProfile != nil
+        menu.addItem(contextMenuItem("连接", #selector(connectAction), enabled: hasProfile))
+        menu.addItem(contextMenuItem("断开连接", #selector(disconnectAction), enabled: hasProfile && session != nil))
+        menu.addItem(.separator())
+        menu.addItem(contextMenuItem("编辑连接", #selector(editAction), enabled: hasProfile))
+        menu.addItem(contextMenuItem("移除连接", #selector(removeConnection), enabled: hasProfile))
+        menu.addItem(.separator())
+        menu.addItem(contextMenuItem("新建连接", #selector(addAction), enabled: true))
+        return menu
+    }
+
+    private func contextMenuItem(
+        _ title: String,
+        _ action: Selector,
+        key: String = "",
+        enabled: Bool
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        if !key.isEmpty { item.keyEquivalentModifierMask = [.command] }
+        item.target = self
+        item.isEnabled = enabled
+        return item
     }
 
     private func showErrorIfNeeded() {
@@ -448,7 +561,22 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func selectAll() {
         if let editor = activeTextEditor() { editor.selectAll(nil); return }
-        browserTable.selectAll(nil)
+        let itemRows = browserRows.indices.filter { browserRows[$0].item != nil }
+        browserTable.selectRowIndexes(IndexSet(itemRows), byExtendingSelection: false)
+    }
+
+    func showProperties() {
+        guard let item = selectedItems.first, selectedItems.count == 1, let session else { return }
+        propertiesWindowController?.close()
+        let controller = RemoteItemPropertiesWindowController(
+            item: item,
+            connectionName: session.profile.name,
+            protocolName: session.profile.protocolType.rawValue,
+            client: session.client
+        )
+        propertiesWindowController = controller
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
     }
 
     private func configureToolbar() {
@@ -483,6 +611,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             menuItem("下载", #selector(downloadAction), key: "d"),
             .separator(),
             menuItem("重命名", #selector(renameAction)),
+            menuItem("属性", #selector(propertiesAction), key: "i"),
             menuItem("复制到指定文件夹", #selector(copyAction)),
             menuItem("移动到指定文件夹", #selector(moveAction)),
             menuItem("删除", #selector(deleteAction), key: "\u{8}")
@@ -582,6 +711,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc fileprivate func copyAction() { copyItems() }
     @objc fileprivate func moveAction() { moveItems() }
     @objc fileprivate func deleteAction() { deleteItems() }
+    @objc fileprivate func propertiesAction() { showProperties() }
     @objc fileprivate func syncAction() { runSync() }
     @objc fileprivate func configureSyncAction() { configureSync() }
     @objc fileprivate func toggleToolbarAction() { window?.toggleToolbarShown(self) }
@@ -662,6 +792,193 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     private func symbol(_ name: String) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: nil)
+    }
+}
+
+@MainActor
+private final class RemoteItemPropertiesWindowController: NSWindowController {
+    private let item: RemoteItem
+    private let connectionName: String
+    private let protocolName: String
+    private let client: any RemoteClient
+    private let sizeValue = NSTextField(labelWithString: "")
+    private var sizeTask: Task<Void, Never>?
+
+    private lazy var calculateSizeButton: NSButton = {
+        let button = NSButton(title: "计算文件夹大小", target: self, action: #selector(calculateFolderSize))
+        button.bezelStyle = .rounded
+        return button
+    }()
+
+    init(item: RemoteItem, connectionName: String, protocolName: String, client: any RemoteClient) {
+        self.item = item
+        self.connectionName = connectionName
+        self.protocolName = protocolName
+        self.client = client
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 320),
+            styleMask: [.titled, .closable, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "属性 - \(item.name)"
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        super.init(window: panel)
+        panel.contentView = makeContentView(panel: panel)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    deinit { sizeTask?.cancel() }
+
+    private func makeContentView(panel: NSPanel) -> NSView {
+        let root = NSView()
+        let image = NSImageView(image: NSImage(systemSymbolName: item.isDirectory ? "folder.fill" : "doc", accessibilityDescription: nil) ?? NSImage())
+        image.contentTintColor = item.isDirectory ? .systemBlue : .secondaryLabelColor
+        image.imageScaling = .scaleProportionallyDown
+        image.translatesAutoresizingMaskIntoConstraints = false
+        image.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        image.heightAnchor.constraint(equalToConstant: 34).isActive = true
+
+        let title = NSTextField(labelWithString: item.name)
+        title.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        title.lineBreakMode = .byTruncatingMiddle
+        let subtitle = NSTextField(labelWithString: typeDescription)
+        subtitle.font = NSFont.systemFont(ofSize: 12)
+        subtitle.textColor = .secondaryLabelColor
+        let titleStack = NSStackView(views: [title, subtitle])
+        titleStack.orientation = .vertical
+        titleStack.spacing = 2
+        let header = NSStackView(views: [image, titleStack])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
+
+        sizeValue.stringValue = item.isDirectory ? "尚未计算" : byteCount(item.size)
+        let details = NSStackView(views: [
+            detailRow("名称", item.name),
+            detailRow("类型", typeDescription),
+            detailRow("位置", item.path),
+            detailRow("大小", valueField: sizeValue),
+            detailRow("修改日期", item.modifiedAt?.formatted(date: .long, time: .shortened) ?? "服务器未提供"),
+            detailRow("连接", "\(connectionName)（\(protocolName)）")
+        ])
+        details.orientation = .vertical
+        details.spacing = 8
+
+        let closeButton = NSButton(title: "关闭", target: panel, action: #selector(NSWindow.performClose(_:)))
+        closeButton.bezelStyle = .rounded
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.alignment = .centerY
+        actions.addArrangedSubview(item.isDirectory ? calculateSizeButton : NSView())
+        actions.addArrangedSubview(NSView())
+        actions.addArrangedSubview(closeButton)
+        actions.arrangedSubviews[1].setContentHuggingPriority(.defaultLow, for: .horizontal)
+        actions.arrangedSubviews[1].setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let stack = NSStackView(views: [header, details, actions])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+            header.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            details.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            actions.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+        return root
+    }
+
+    private var typeDescription: String {
+        guard !item.isDirectory else { return "文件夹" }
+        return item.fileExtension.isEmpty ? "文件" : "\(item.fileExtension.uppercased()) 文件"
+    }
+
+    private func detailRow(_ label: String, _ value: String) -> NSStackView {
+        let valueField = NSTextField(wrappingLabelWithString: value)
+        valueField.lineBreakMode = .byTruncatingMiddle
+        return detailRow(label, valueField: valueField)
+    }
+
+    private func detailRow(_ label: String, valueField: NSTextField) -> NSStackView {
+        let labelField = NSTextField(labelWithString: label)
+        labelField.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        labelField.textColor = .secondaryLabelColor
+        labelField.alignment = .right
+        labelField.widthAnchor.constraint(equalToConstant: 78).isActive = true
+        valueField.font = NSFont.systemFont(ofSize: 12)
+        valueField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [labelField, valueField])
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 12
+        return row
+    }
+
+    @objc private func calculateFolderSize() {
+        guard item.isDirectory, sizeTask == nil else { return }
+        sizeValue.stringValue = "正在计算…"
+        calculateSizeButton.isEnabled = false
+        sizeTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await Self.directorySize(at: self.item.path, client: self.client)
+                guard !Task.isCancelled else { return }
+                self.sizeValue.stringValue = ByteCountFormatter.string(fromByteCount: result.bytes, countStyle: .file)
+                    + "（\(result.entries) 项）"
+                    + (result.itemsWithoutSize == 0 ? "" : "，\(result.itemsWithoutSize) 项未提供大小")
+            } catch is CancellationError {
+                return
+            } catch {
+                self.sizeValue.stringValue = "无法计算：\(error.localizedDescription)"
+            }
+            self.calculateSizeButton.isEnabled = true
+            self.sizeTask = nil
+        }
+    }
+
+    nonisolated private static func directorySize(
+        at rootPath: String,
+        client: any RemoteClient
+    ) async throws -> (bytes: Int64, entries: Int, itemsWithoutSize: Int) {
+        var pendingPaths = [rootPath]
+        var visitedPaths = Set([rootPath])
+        var bytes: Int64 = 0
+        var entries = 0
+        var itemsWithoutSize = 0
+
+        while let path = pendingPaths.popLast() {
+            try Task.checkCancellation()
+            for child in try await client.list(at: path) {
+                try Task.checkCancellation()
+                entries += 1
+                guard entries <= 100_000 else {
+                    throw CloudShelfError.commandFailed("文件夹包含超过 100,000 项，已停止计算大小。")
+                }
+                if child.isDirectory {
+                    if visitedPaths.insert(child.path).inserted { pendingPaths.append(child.path) }
+                } else if let size = child.size {
+                    guard size <= Int64.max - bytes else {
+                        throw CloudShelfError.commandFailed("文件夹大小超出可显示范围。")
+                    }
+                    bytes += size
+                } else {
+                    itemsWithoutSize += 1
+                }
+            }
+        }
+        return (bytes, entries, itemsWithoutSize)
+    }
+
+    private func byteCount(_ bytes: Int64?) -> String {
+        bytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "服务器未提供"
     }
 }
 

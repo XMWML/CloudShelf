@@ -8,7 +8,9 @@ CloudShelf is a native macOS FTP, SFTP, and WebDAV workspace manager. It present
 
 - Connect and switch between multiple FTP, SFTP, and WebDAV servers.
 - Browse remote folders with directory navigation, sortable file-style columns, drag-and-drop upload, and a transfer queue.
+- Show a Linux-style `..` parent-directory entry at the top of every non-root folder.
 - Upload and download files and folders; create folders; rename, copy, move, and recursively delete remote content.
+- Right-click remote files, folders, and connections for common actions. Inspect one selected remote item with `Command-I` to see its path, type, modified date, and size; folder sizes are calculated on demand.
 - Save passwords in macOS Keychain. Connection metadata is stored separately in Application Support.
 - Support SFTP password, SSH agent, and private-key authentication.
 - Store SFTP host fingerprints in CloudShelf's own `known_hosts` file. Choose either strict checking or accepting a host key on first connection.
