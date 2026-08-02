@@ -22,20 +22,28 @@ CloudShelf 是一个原生 macOS FTP、SFTP、WebDAV 文件管理器。它把每
 
 1. 打开 `dist/CloudShelf.app`。首次启动会显示空的文件管理器窗口。
 2. 点击左下角 **新建连接** 或工具栏第一个加号。
-3. 填写连接名称、协议、主机、端口、用户名和远端根目录。
+3. 填写连接名称、协议、服务器 URL 和用户名。URL 中包含协议、端口和远端根目录。
 4. FTP/FTPS/WebDAV 选择“密码”并输入密码；SFTP 可以选择“密码”、“SSH Agent”或“私钥”。
 5. 点“保存”。连接会出现在左侧列表，并立即尝试连接。成功后在左侧选中它即可浏览远端文件。
 6. 工具栏提供上级目录、刷新、新建文件夹、上传、下载、复制、移动、删除和同步操作。也可以直接把 Finder 中的文件拖到右侧文件列表上传。
 
-### 带路径的 WebDAV 地址
+### 服务器 URL
 
-WebDAV 的“服务器 / WebDAV URL”字段可直接填写完整地址。以下地址可以直接使用：
+所有协议都使用一个完整 URL，不再单独设置端口、TLS 或远端根目录：
+
+```text
+ftp://files.example.com:21/backups
+sftp://files.example.com:22/home/user
+http://webdav.example.com:5244/dav
+```
+
+WebDAV 可以直接填写带路径的 IPv6 地址：
 
 ```text
 http://[2409:8a55:4e87:a560:aaae:68de:76eb:5550]:5244/dav
 ```
 
-选择 `WebDAV` 协议后粘贴这条地址即可。应用会自动识别 IPv6、端口 `5244`、`http` 协议和 `/dav` 根路径；“端口”字段填写 `5244` 或保留默认值都不会覆盖 URL 中的端口，“远端根目录”保持 `/`。
+选择 `WebDAV` 协议后粘贴这条地址即可。应用会自动识别 IPv6、端口 `5244`、`http` 协议和 `/dav` 根路径。用户名仍填写在单独的“用户名”字段，密码填写在“密码”字段。
 
 ### 快捷键与菜单
 
@@ -72,7 +80,7 @@ http://[2409:8a55:4e87:a560:aaae:68de:76eb:5550]:5244/dav
 - 密码：macOS 钥匙串服务 `com.cloudshelf.credentials`
 - SFTP 主机密钥：`~/Library/Application Support/CloudShelf/known_hosts`
 
-密码不会写入 `connections.json`。初次连接可以使用 `Accept new keys` 保存主机密钥；确认服务器指纹后，建议改为 `Strict`。
+密码不会写入 `connections.json`。为保护密码，编辑连接时密码框不会回填原密码；留空保存会保留钥匙串中的现有密码。初次连接可以使用 `Accept new keys` 保存主机密钥；确认服务器指纹后，建议改为 `Strict`。
 
 连接、文件操作、传输或同步失败时，应用会弹出“操作失败”窗口，显示底层网络、身份验证或协议错误的具体原因。
 

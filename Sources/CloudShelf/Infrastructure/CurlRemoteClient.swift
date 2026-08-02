@@ -6,8 +6,9 @@ actor CurlRemoteClient: RemoteClient {
     private let password: String?
 
     init(profile: ConnectionProfile, password: String?) throws {
-        self.profile = profile
-        self.endpoint = try RemoteEndpoint(profile: profile)
+        let endpoint = try RemoteEndpoint(profile: profile)
+        self.profile = endpoint.profile
+        self.endpoint = endpoint
         self.password = password
     }
 

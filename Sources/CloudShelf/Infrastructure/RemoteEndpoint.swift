@@ -10,27 +10,52 @@ struct RemoteEndpoint: Sendable {
         }
 
         var resolved = profile
-        if profile.protocolType == .webDAV, trimmedHost.contains("://") {
+        if trimmedHost.contains("://") {
             guard let components = URLComponents(string: trimmedHost),
                   let scheme = components.scheme?.lowercased(),
-                  scheme == "http" || scheme == "https",
                   let host = components.host, !host.isEmpty else {
-                throw CloudShelfError.invalidProfile("WebDAV 地址必须是完整的 http:// 或 https:// URL。")
+                throw CloudShelfError.invalidProfile("服务器地址必须是完整 URL。")
             }
             guard components.query == nil, components.fragment == nil else {
-                throw CloudShelfError.invalidProfile("WebDAV 服务器地址不能包含查询参数或锚点。")
+                throw CloudShelfError.invalidProfile("服务器 URL 不能包含查询参数或锚点。")
             }
+            guard components.password == nil else {
+                throw CloudShelfError.invalidProfile("请在密码字段填写密码，不要把密码写入 URL。")
+            }
+
+            switch profile.protocolType {
+            case .ftp:
+                guard scheme == "ftp" || scheme == "ftps" else {
+                    throw CloudShelfError.invalidProfile("FTP 连接请使用 ftp:// 或 ftps:// URL。")
+                }
+                resolved.useTLS = scheme == "ftps"
+            case .sftp:
+                guard scheme == "sftp" else {
+                    throw CloudShelfError.invalidProfile("SFTP 连接请使用 sftp:// URL。")
+                }
+                resolved.useTLS = false
+            case .webDAV:
+                guard scheme == "http" || scheme == "https" else {
+                    throw CloudShelfError.invalidProfile("WebDAV 连接请使用 http:// 或 https:// URL。")
+                }
+                resolved.useTLS = scheme == "https"
+            }
+
             resolved.host = host
-            resolved.port = components.port ?? profile.port
-            resolved.useTLS = scheme == "https"
+            resolved.port = components.port ?? profile.protocolType.defaultPort
+            if resolved.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let urlUser = components.user, !urlUser.isEmpty {
+                resolved.username = urlUser.removingPercentEncoding ?? urlUser
+            }
             let urlPath = components.path.isEmpty ? "/" : components.path
             resolved.basePath = profile.basePath == "/" ? RemotePath.normalized(urlPath) : RemotePath.join(urlPath, profile.basePath)
             self.profile = resolved
             return
         }
 
-        guard !trimmedHost.contains("://"), !trimmedHost.contains("/") else {
-            throw CloudShelfError.invalidProfile("FTP 和 SFTP 请只填写主机名或 IP 地址；WebDAV 可填写完整 URL。")
+        // Existing profiles from older versions may still contain a host and separate port.
+        guard !trimmedHost.contains("/") else {
+            throw CloudShelfError.invalidProfile("服务器 URL 无效。")
         }
         self.profile = resolved
     }

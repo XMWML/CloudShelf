@@ -44,7 +44,7 @@ public enum CloudShelfError: LocalizedError, Sendable {
         case .invalidProfile(let message), .unsupported(let message), .commandFailed(let message), .invalidResponse(let message):
             message
         case .missingCredential:
-            "The saved credential is missing. Edit this connection and save it again."
+            "没有找到已保存的密码。请编辑连接，填写密码后重新保存。"
         }
     }
 }

@@ -7,8 +7,9 @@ actor SFTPRemoteClient: RemoteClient {
     private let knownHostsURL: URL
 
     init(profile: ConnectionProfile, secret: String?) throws {
-        self.profile = profile
-        self.endpoint = try RemoteEndpoint(profile: profile)
+        let endpoint = try RemoteEndpoint(profile: profile)
+        self.profile = endpoint.profile
+        self.endpoint = endpoint
         self.secret = secret
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("CloudShelf", isDirectory: true)

@@ -37,6 +37,10 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private var clipboardOperation: RemoteClipboardOperation = .copy
     private var presentingError = false
     private var lastSessionError: String?
+    private var displayedProfiles: [ConnectionProfile] = []
+    private var displayedSessionID: UUID?
+    private var displayedItems: [RemoteItem] = []
+    private var restoringConnectionSelection = false
 
     init() {
         let window = NSWindow(
@@ -97,6 +101,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard notification.object as? NSTableView === connectionTable else { return }
+        guard !restoringConnectionSelection else { return }
         let row = connectionTable.selectedRow
         guard row >= 0, row < store.profiles.count else { return }
         let profile = store.profiles[row]
@@ -132,8 +137,8 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     @objc func refreshViews() {
-        connectionTable.reloadData()
-        browserTable.reloadData()
+        reloadConnectionTableIfNeeded()
+        reloadBrowserTableIfNeeded()
         transferTable.reloadData()
         pathLabel.stringValue = session?.location ?? "/"
         if let session {
@@ -144,10 +149,39 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         showErrorIfNeeded()
     }
 
+    private func reloadConnectionTableIfNeeded() {
+        guard displayedProfiles != store.profiles else { return }
+        displayedProfiles = store.profiles
+        connectionTable.reloadData()
+
+        guard let selectedProfileID,
+              let row = store.profiles.firstIndex(where: { $0.id == selectedProfileID }),
+              connectionTable.selectedRow != row else { return }
+        restoringConnectionSelection = true
+        connectionTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        restoringConnectionSelection = false
+    }
+
+    private func reloadBrowserTableIfNeeded() {
+        let currentSessionID = session?.id
+        let currentItems = session?.items ?? []
+        guard displayedSessionID != currentSessionID || displayedItems != currentItems else { return }
+        let selectedPaths = displayedSessionID == currentSessionID ? selectedItems.map(\.path) : []
+        displayedSessionID = currentSessionID
+        displayedItems = currentItems
+        browserTable.reloadData()
+        let selectedRows = IndexSet(currentItems.indices.filter { selectedPaths.contains(currentItems[$0].path) })
+        browserTable.selectRowIndexes(selectedRows, byExtendingSelection: false)
+    }
+
     func addConnection() {
         let form = ConnectionForm()
         presentForm(title: "新建连接", form: form, actionTitle: "保存") { [weak self] in
-            guard let self, let profile = form.profile() else { return }
+            guard let self else { return }
+            guard let profile = form.profile() else {
+                self.presentError(form.validationError ?? "请检查连接设置。")
+                return
+            }
             Task {
                 await self.store.save(profile: profile, secret: form.secret)
                 self.selectedProfileID = profile.id
@@ -162,7 +196,11 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         guard let profile = selectedProfile else { return }
         let form = ConnectionForm(profile: profile)
         presentForm(title: "编辑连接", form: form, actionTitle: "保存") { [weak self] in
-            guard let self, let changed = form.profile(existing: profile) else { return }
+            guard let self else { return }
+            guard let changed = form.profile(existing: profile) else {
+                self.presentError(form.validationError ?? "请检查连接设置。")
+                return
+            }
             Task {
                 self.store.unmount(profile)
                 await self.store.save(profile: changed, secret: form.secret)
@@ -357,10 +395,12 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         }
     }
 
-    private func isEditingText() -> Bool { window?.firstResponder is NSTextView }
+    private func activeTextEditor() -> NSTextView? {
+        (NSApp.keyWindow?.firstResponder ?? window?.firstResponder) as? NSTextView
+    }
 
     func copySelection() {
-        if isEditingText() { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self); return }
+        if let editor = activeTextEditor() { editor.copy(nil); return }
         guard let session, !selectedItems.isEmpty else {
             store.lastError = "请选择要复制的远端文件。"
             return
@@ -372,7 +412,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     func cutSelection() {
-        if isEditingText() { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self); return }
+        if let editor = activeTextEditor() { editor.cut(nil); return }
         guard let session, !selectedItems.isEmpty else {
             store.lastError = "请选择要剪切的远端文件。"
             return
@@ -384,7 +424,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     func pasteSelection() {
-        if isEditingText() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self); return }
+        if let editor = activeTextEditor() { editor.paste(nil); return }
         guard let session else {
             store.lastError = "请先连接并打开一个远端文件夹。"
             return
@@ -407,7 +447,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     func selectAll() {
-        if isEditingText() { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: self); return }
+        if let editor = activeTextEditor() { editor.selectAll(nil); return }
         browserTable.selectAll(nil)
     }
 
@@ -756,15 +796,12 @@ private final class FileManagerViewController: NSViewController {
 private final class ConnectionForm: NSView {
     private let name = NSTextField(string: "")
     private let protocolBox = NSPopUpButton()
-    private let host = NSTextField(string: "")
-    private let port = NSTextField(string: "22")
+    private let serverURL = NSTextField(string: "")
     private let username = NSTextField(string: "")
-    private let root = NSTextField(string: "/")
     private let authentication = NSPopUpButton()
     private let secretField = NSSecureTextField(string: "")
     private let keyPath = NSTextField(string: "")
     private let hostKeyPolicy = NSPopUpButton()
-    private let tls = NSButton(checkboxWithTitle: "使用 TLS", target: nil, action: nil)
     private let authenticationTitles = ["密码", "SSH Agent", "私钥"]
     private let hostKeyTitles = ["严格校验", "首次接受新密钥"]
 
@@ -773,56 +810,62 @@ private final class ConnectionForm: NSView {
         return value.isEmpty ? nil : value
     }
 
+    var validationError: String? {
+        guard !name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "请填写连接名称。"
+        }
+        guard let protocolType = RemoteProtocol(rawValue: protocolBox.titleOfSelectedItem ?? "") else {
+            return "请选择连接协议。"
+        }
+        return Self.urlValidationError(serverURL.stringValue, for: protocolType)
+    }
+
     init(profile: ConnectionProfile? = nil) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 364))
+        super.init(frame: NSRect(x: 0, y: 0, width: 440, height: 272))
         protocolBox.addItems(withTitles: RemoteProtocol.allCases.map(\.rawValue))
         protocolBox.target = self
         protocolBox.action = #selector(protocolChanged)
         authentication.addItems(withTitles: authenticationTitles)
         hostKeyPolicy.addItems(withTitles: hostKeyTitles)
-        host.placeholderString = "files.example.com 或 http://[IPv6]:5244/dav"
-        host.toolTip = "WebDAV 可直接填写完整 http:// 或 https:// 地址，端口和路径会自动解析。"
-        root.toolTip = "完整 WebDAV URL 已包含 /dav 等路径时，保持 / 即可。"
-        tls.title = "使用 TLS"
+        serverURL.toolTip = "请输入包含协议、主机、端口和路径的完整 URL。"
+        secretField.placeholderString = profile == nil ? "输入密码" : "留空则保留已保存的密码"
+        secretField.toolTip = "为保护密码，编辑连接时不会显示钥匙串中的现有密码。"
         layout(rows: [
-            ("名称", name), ("协议", protocolBox), ("服务器 / WebDAV URL", host), ("端口", port),
-            ("用户名", username), ("远端根目录", root), ("认证方式", authentication),
-            ("密码", secretField), ("私钥路径", keyPath), ("主机密钥", hostKeyPolicy), ("", tls)
+            ("名称", name), ("协议", protocolBox), ("服务器 URL", serverURL), ("用户名", username),
+            ("认证方式", authentication), (profile == nil ? "密码" : "密码（留空不改）", secretField),
+            ("私钥路径", keyPath), ("主机密钥", hostKeyPolicy)
         ])
         if let profile {
             name.stringValue = profile.name
             protocolBox.selectItem(withTitle: profile.protocolType.rawValue)
-            host.stringValue = profile.host
-            port.stringValue = String(profile.port)
+            serverURL.stringValue = Self.urlString(for: profile)
             username.stringValue = profile.username
-            root.stringValue = profile.basePath
             authentication.selectItem(at: Self.authenticationIndex(profile.authentication))
             keyPath.stringValue = profile.privateKeyPath ?? ""
             hostKeyPolicy.selectItem(at: Self.hostKeyIndex(profile.hostKeyPolicy))
-            tls.state = profile.useTLS ? .on : .off
         } else {
             protocolBox.selectItem(withTitle: RemoteProtocol.sftp.rawValue)
             hostKeyPolicy.selectItem(at: Self.hostKeyIndex(.acceptNew))
-            tls.state = .off
         }
+        updateURLPresentation()
     }
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 440, height: 364) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 440, height: 272) }
 
     func profile(existing: ConnectionProfile? = nil) -> ConnectionProfile? {
         guard let protocolType = RemoteProtocol(rawValue: protocolBox.titleOfSelectedItem ?? ""),
               let method = Self.authentication(at: authentication.indexOfSelectedItem),
               let keyPolicy = Self.hostKeyPolicy(at: hostKeyPolicy.indexOfSelectedItem),
-              let parsedPort = Int(port.stringValue), !name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !host.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+              validationError == nil else { return nil }
+        let address = serverURL.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         return ConnectionProfile(
-            id: existing?.id ?? UUID(), name: name.stringValue, protocolType: protocolType, host: host.stringValue,
-            port: parsedPort, username: username.stringValue, basePath: root.stringValue,
+            id: existing?.id ?? UUID(), name: name.stringValue, protocolType: protocolType, host: address,
+            port: protocolType.defaultPort, username: username.stringValue, basePath: "/",
             authentication: protocolType == .sftp ? method : .password,
             privateKeyPath: keyPath.stringValue.isEmpty ? nil : keyPath.stringValue,
-            useTLS: tls.state == .on, hostKeyPolicy: keyPolicy,
+            useTLS: protocolType.defaultTLS, hostKeyPolicy: keyPolicy,
             createdAt: existing?.createdAt ?? .now, syncRules: existing?.syncRules ?? []
         )
     }
@@ -849,9 +892,56 @@ private final class ConnectionForm: NSView {
     }
 
     @objc private func protocolChanged() {
+        updateURLPresentation()
+    }
+
+    private func updateURLPresentation() {
         guard let type = RemoteProtocol(rawValue: protocolBox.titleOfSelectedItem ?? "") else { return }
-        port.stringValue = String(type.defaultPort)
-        tls.state = type.defaultTLS ? .on : .off
+        switch type {
+        case .ftp:
+            serverURL.placeholderString = "ftp://files.example.com:21/目录"
+        case .sftp:
+            serverURL.placeholderString = "sftp://files.example.com:22/目录"
+        case .webDAV:
+            serverURL.placeholderString = "http://[IPv6]:5244/dav"
+        }
+    }
+
+    private static func urlValidationError(_ value: String, for protocolType: RemoteProtocol) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host, !host.isEmpty,
+              components.query == nil, components.fragment == nil else {
+            return "请输入包含协议和主机的完整服务器 URL。"
+        }
+        guard components.password == nil else {
+            return "请在密码字段填写密码，不要把密码写入 URL。"
+        }
+        switch protocolType {
+        case .ftp:
+            return (scheme == "ftp" || scheme == "ftps") ? nil : "FTP 连接请使用 ftp:// 或 ftps:// URL。"
+        case .sftp:
+            return scheme == "sftp" ? nil : "SFTP 连接请使用 sftp:// URL。"
+        case .webDAV:
+            return (scheme == "http" || scheme == "https") ? nil : "WebDAV 连接请使用 http:// 或 https:// URL。"
+        }
+    }
+
+    private static func urlString(for profile: ConnectionProfile) -> String {
+        let stored = profile.host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stored.contains("://") { return stored }
+
+        var components = URLComponents()
+        switch profile.protocolType {
+        case .ftp: components.scheme = profile.useTLS ? "ftps" : "ftp"
+        case .sftp: components.scheme = "sftp"
+        case .webDAV: components.scheme = profile.useTLS ? "https" : "http"
+        }
+        components.host = stored
+        components.port = profile.port
+        components.path = profile.basePath
+        return components.url?.absoluteString ?? stored
     }
 
     private static func authenticationIndex(_ method: AuthenticationMethod) -> Int {
