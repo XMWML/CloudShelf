@@ -57,6 +57,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private var displayedProfiles: [ConnectionProfile] = []
     private var displayedSessionID: UUID?
     private var displayedRows: [BrowserRow] = []
+    private var displayedTransfers: [TransferTask] = []
     private var restoringConnectionSelection = false
     private var propertiesWindowController: RemoteItemPropertiesWindowController?
 
@@ -81,7 +82,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func numberOfRows(in tableView: NSTableView) -> Int {
         if tableView === connectionTable { return store.profiles.count }
         if tableView === browserTable { return browserRows.count }
-        return min(8, store.transfers.count)
+        return displayedTransfers.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -116,7 +117,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
                 icon = identifier == "name" ? symbol(item.isDirectory ? "folder.fill" : "doc") : nil
             }
         } else {
-            let transfer = Array(store.transfers.suffix(8).reversed())[row]
+            let transfer = displayedTransfers[row]
             switch identifier {
             case "transfer": text = transfer.title
             case "state": text = "\(transfer.connectionName) - \(transfer.detail)"
@@ -186,7 +187,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc func refreshViews() {
         reloadConnectionTableIfNeeded()
         reloadBrowserTableIfNeeded()
-        transferTable.reloadData()
+        reloadTransferTableIfNeeded()
         pathLabel.stringValue = session?.location ?? "/"
         if let session {
             connectionStatus.stringValue = "\(session.profile.name)  |  \(session.profile.protocolType.rawValue)  |  \(session.isLoading ? "正在加载" : "已连接")"
@@ -219,6 +220,13 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         browserTable.reloadData()
         let selectedRows = IndexSet(currentRows.indices.filter { selectedIdentifiers.contains(currentRows[$0].identifier) })
         browserTable.selectRowIndexes(selectedRows, byExtendingSelection: false)
+    }
+
+    private func reloadTransferTableIfNeeded() {
+        let currentTransfers = Array(store.transfers.suffix(8).reversed())
+        guard displayedTransfers != currentTransfers else { return }
+        displayedTransfers = currentTransfers
+        transferTable.reloadData()
     }
 
     func addConnection() {
@@ -582,7 +590,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private func configureToolbar() {
         let toolbar = NSToolbar(identifier: "CloudShelfToolbar")
         toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
+        toolbar.displayMode = .iconAndLabel
         window?.toolbar = toolbar
     }
 
@@ -683,7 +691,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         case "up": item.label = "上级"; item.toolTip = "返回上级目录"; item.image = symbol("arrow.up"); item.target = self; item.action = #selector(upAction)
         case "reload": item.label = "刷新"; item.toolTip = "刷新当前目录"; item.image = symbol("arrow.clockwise"); item.target = self; item.action = #selector(reloadAction)
         case "folder": item.label = "新建文件夹"; item.toolTip = "新建文件夹"; item.image = symbol("folder.badge.plus"); item.target = self; item.action = #selector(folderAction)
-        case "upload": item.label = "上传"; item.toolTip = "上传文件"; item.image = symbol("arrow.up.doc"); item.target = self; item.action = #selector(uploadAction)
+        case "upload": item.label = "上传"; item.toolTip = "上传文件或文件夹"; item.image = symbol("arrow.up.doc"); item.target = self; item.action = #selector(uploadAction)
         case "download": item.label = "下载"; item.toolTip = "下载所选文件"; item.image = symbol("arrow.down.doc"); item.target = self; item.action = #selector(downloadAction)
         case "copy": item.label = "复制"; item.toolTip = "复制到指定文件夹"; item.image = symbol("doc.on.doc"); item.target = self; item.action = #selector(copyAction)
         case "move": item.label = "移动"; item.toolTip = "移动到指定文件夹"; item.image = symbol("folder.badge.gearshape"); item.target = self; item.action = #selector(moveAction)

@@ -84,6 +84,69 @@ final class RemoteSession: ObservableObject, Identifiable {
     }
 }
 
+private struct FolderUploadPlan: Sendable {
+    struct File: Sendable {
+        let url: URL
+        let remotePath: String
+    }
+
+    let directories: [String]
+    let files: [File]
+    let skippedItems: Int
+
+    static func make(source: URL, remoteParent: String) throws -> FolderUploadPlan {
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        let root = source.standardizedFileURL
+        let rootValues = try root.resourceValues(forKeys: keys)
+        guard rootValues.isDirectory == true else {
+            throw CloudShelfError.invalidProfile("选择的项目不是文件夹。")
+        }
+        guard !root.lastPathComponent.isEmpty else {
+            throw CloudShelfError.invalidProfile("无法确定文件夹名称。")
+        }
+
+        let remoteRoot = RemotePath.join(remoteParent, root.lastPathComponent)
+        let rootComponents = root.pathComponents
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: Array(keys),
+            options: []
+        ) else {
+            throw CloudShelfError.commandFailed("无法读取本地文件夹。")
+        }
+
+        var directories = [remoteRoot]
+        var files: [File] = []
+        var skippedItems = 0
+        for case let child as URL in enumerator {
+            let values = try child.resourceValues(forKeys: keys)
+            let components = child.standardizedFileURL.pathComponents.dropFirst(rootComponents.count)
+            guard !components.isEmpty else { continue }
+            let remotePath = components.reduce(remoteRoot) { RemotePath.join($0, $1) }
+
+            if values.isSymbolicLink == true {
+                skippedItems += 1
+            } else if values.isDirectory == true {
+                directories.append(remotePath)
+            } else if values.isRegularFile == true {
+                files.append(File(url: child, remotePath: remotePath))
+            } else {
+                skippedItems += 1
+            }
+        }
+
+        directories.sort {
+            let leftDepth = $0.split(separator: "/").count
+            let rightDepth = $1.split(separator: "/").count
+            return leftDepth == rightDepth
+                ? $0.localizedStandardCompare($1) == .orderedAscending
+                : leftDepth < rightDepth
+        }
+        files.sort { $0.remotePath.localizedStandardCompare($1.remotePath) == .orderedAscending }
+        return FolderUploadPlan(directories: directories, files: files, skippedItems: skippedItems)
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published private(set) var profiles: [ConnectionProfile] = []
@@ -212,17 +275,69 @@ final class WorkspaceStore: ObservableObject {
 
     private func enqueueUpload(_ url: URL, session: RemoteSession) {
         let transfer = TransferTask(direction: .upload, title: url.lastPathComponent, connectionName: session.profile.name)
+        let destination = session.location
         transfers.append(transfer)
         Task {
-            updateTransfer(transfer.id, status: .running, detail: "正在上传", startedAt: .now)
             do {
-                try await session.client.upload(url, to: session.location)
-                updateTransfer(transfer.id, status: .succeeded, detail: "上传完成", finishedAt: .now)
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+                if values.isDirectory == true {
+                    updateTransfer(transfer.id, status: .running, detail: "正在准备文件夹", startedAt: .now)
+                    let plan = try await Task.detached(priority: .userInitiated) {
+                        try FolderUploadPlan.make(source: url, remoteParent: destination)
+                    }.value
+                    try await upload(folder: plan, client: session.client, transferID: transfer.id)
+                    let skipped = plan.skippedItems == 0 ? "" : "，跳过 \(plan.skippedItems) 项"
+                    updateTransfer(
+                        transfer.id,
+                        status: .succeeded,
+                        detail: "已上传 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹\(skipped)",
+                        finishedAt: .now
+                    )
+                } else {
+                    updateTransfer(transfer.id, status: .running, detail: "正在上传", startedAt: .now)
+                    try await session.client.upload(url, to: destination)
+                    updateTransfer(transfer.id, status: .succeeded, detail: "上传完成", finishedAt: .now)
+                }
                 await session.reload()
             } catch {
                 updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
                 lastError = error.localizedDescription
             }
+        }
+    }
+
+    private func upload(
+        folder plan: FolderUploadPlan,
+        client: any RemoteClient,
+        transferID: UUID
+    ) async throws {
+        for (index, path) in plan.directories.enumerated() {
+            updateTransfer(
+                transferID,
+                status: .running,
+                detail: "正在创建文件夹 \(index + 1)/\(plan.directories.count)"
+            )
+            try await ensureRemoteDirectory(path, client: client)
+        }
+
+        for (index, file) in plan.files.enumerated() {
+            updateTransfer(
+                transferID,
+                status: .running,
+                detail: "正在上传文件 \(index + 1)/\(plan.files.count)"
+            )
+            try await client.upload(file.url, to: RemotePath.parent(of: file.remotePath))
+        }
+    }
+
+    private func ensureRemoteDirectory(_ path: String, client: any RemoteClient) async throws {
+        let parent = RemotePath.parent(of: path)
+        let name = RemotePath.name(of: path)
+        do {
+            try await client.createDirectory(named: name, in: parent)
+        } catch {
+            let entries = try await client.list(at: parent)
+            guard entries.contains(where: { $0.path == path && $0.isDirectory }) else { throw error }
         }
     }
 

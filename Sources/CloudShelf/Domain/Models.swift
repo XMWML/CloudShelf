@@ -154,20 +154,20 @@ public struct SyncRule: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-public enum TransferDirection: String, Sendable {
+public enum TransferDirection: String, Sendable, Equatable {
     case upload
     case download
     case sync
 }
 
-public enum TransferStatus: String, Sendable {
+public enum TransferStatus: String, Sendable, Equatable {
     case queued
     case running
     case succeeded
     case failed
 }
 
-public struct TransferTask: Identifiable, Sendable {
+public struct TransferTask: Identifiable, Sendable, Equatable {
     public let id: UUID
     public let direction: TransferDirection
     public let title: String
