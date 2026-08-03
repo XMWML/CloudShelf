@@ -81,6 +81,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     fileprivate let transferTable = NSTableView()
     fileprivate let pathLabel = NSTextField(labelWithString: "/")
     fileprivate let connectionStatus = NSTextField(labelWithString: "未选择连接")
+    fileprivate let activityIndicator = NSProgressIndicator()
     fileprivate let sidebarConnectionStatus = NSTextField(labelWithString: "未选择连接")
     fileprivate let connectionToggleButton = NSButton(title: "连接", target: nil, action: nil)
     private var selectedProfileID: UUID?
@@ -329,6 +330,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         reloadBrowserTableIfNeeded()
         reloadTransferTableIfNeeded()
         pathLabel.stringValue = session?.location ?? "/"
+        setActivityVisible(selectedProfile.flatMap { store.sessions[$0.id] }?.isLoading == true)
         if let profile = selectedProfile {
             let state = connectionDisplayState(for: profile)
             connectionStatus.stringValue = "\(profile.name)  |  \(profile.protocolType.rawValue)  |  \(connectionStateDescription(state))"
@@ -593,6 +595,9 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             makeSyncContent: { [weak self] in self?.makeSyncSettingsContent() ?? SettingsPlaceholderView() },
             currentConcurrency: { [weak self] in self?.store.maximumConcurrentTransfers ?? 3 },
             updateConcurrency: { [weak self] count in self?.store.setMaximumConcurrentTransfers(count) },
+            connectionProfiles: { [weak self] in self?.store.profiles ?? [] },
+            currentAutomaticConnectProfileID: { [weak self] in self?.store.automaticConnectProfileID },
+            updateAutomaticConnectProfile: { [weak self] id in self?.store.setAutomaticConnectProfile(id) },
             didSave: { [weak self] in self?.updatePreview() }
         )
         settingsWindowController = controller
@@ -1093,8 +1098,12 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         case .queued, .running: store.pauseTransfer(id)
         case .paused: store.resumeTransfer(id)
         case .failed: store.retryTransfer(id)
-        case .succeeded: break
+        case .succeeded, .cancelled: break
         }
+    }
+    @objc fileprivate func cancelTransferAction(_ sender: NSButton) {
+        guard let id = (sender as? TransferActionButton)?.transferID else { return }
+        store.cancelTransfer(id)
     }
     @objc fileprivate func toggleAutomaticSyncAction() {
         store.toggleAutomaticSync()
@@ -1335,21 +1344,33 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         let reusable = transferTable.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
         let view = reusable ?? NSTableCellView()
         let button: TransferActionButton
+        let cancel: TransferActionButton
         if view.identifier == nil {
             view.identifier = identifier
             button = TransferActionButton(title: "", target: self, action: #selector(transferAction(_:)))
+            cancel = TransferActionButton(title: "取消", target: self, action: #selector(cancelTransferAction(_:)))
             button.bezelStyle = .rounded
+            cancel.bezelStyle = .rounded
             button.controlSize = .small
+            cancel.controlSize = .small
             button.translatesAutoresizingMaskIntoConstraints = false
+            cancel.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(button)
+            view.addSubview(cancel)
             NSLayoutConstraint.activate([
-                button.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-                button.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+                button.trailingAnchor.constraint(equalTo: view.centerXAnchor, constant: -3),
+                cancel.leadingAnchor.constraint(equalTo: view.centerXAnchor, constant: 3),
+                button.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+                cancel.centerYAnchor.constraint(equalTo: view.centerYAnchor)
             ])
         } else {
-            button = view.subviews.compactMap { $0 as? TransferActionButton }.first!
+            let buttons = view.subviews.compactMap { $0 as? TransferActionButton }
+            button = buttons[0]
+            cancel = buttons[1]
         }
         button.transferID = transfer.id
+        cancel.transferID = transfer.id
+        cancel.isHidden = transfer.status != .paused
         switch transfer.status {
         case .queued, .running:
             button.title = "暂停"
@@ -1363,8 +1384,21 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         case .succeeded:
             button.title = "完成"
             button.isEnabled = false
+        case .cancelled:
+            button.title = "已取消"
+            button.isEnabled = false
         }
         return view
+    }
+
+    private func setActivityVisible(_ visible: Bool) {
+        if visible {
+            activityIndicator.isHidden = false
+            activityIndicator.startAnimation(nil)
+        } else {
+            activityIndicator.stopAnimation(nil)
+            activityIndicator.isHidden = true
+        }
     }
 
     private func transferSpeedDescription(_ transfer: TransferTask) -> String {
@@ -1768,10 +1802,14 @@ private final class FileManagerViewController: NSViewController {
         owner.pathLabel.lineBreakMode = .byTruncatingMiddle
         owner.connectionStatus.font = NSFont.systemFont(ofSize: 12)
         owner.connectionStatus.textColor = .secondaryLabelColor
+        owner.activityIndicator.style = .spinning
+        owner.activityIndicator.controlSize = .small
+        owner.activityIndicator.isDisplayedWhenStopped = false
+        owner.activityIndicator.isHidden = true
         let leftSidebar = sidebarToggleButton(symbolName: "sidebar.left", toolTip: "显示或隐藏左侧连接栏", action: #selector(FileManagerWindowController.toggleConnectionSidebarAction))
         let transferSidebar = sidebarToggleButton(symbolName: "rectangle.bottomthird.inset.filled", toolTip: "显示或隐藏底部传输栏", action: #selector(FileManagerWindowController.toggleTransferPaneAction))
         let previewSidebar = sidebarToggleButton(symbolName: "sidebar.right", toolTip: "显示或隐藏右侧预览栏", action: #selector(FileManagerWindowController.togglePreviewSidebarAction))
-        let top = NSStackView(views: [owner.pathLabel, NSView(), owner.connectionStatus, leftSidebar, transferSidebar, previewSidebar])
+        let top = NSStackView(views: [owner.pathLabel, NSView(), owner.activityIndicator, owner.connectionStatus, leftSidebar, transferSidebar, previewSidebar])
         top.orientation = .horizontal
         top.alignment = .centerY
         top.spacing = 8

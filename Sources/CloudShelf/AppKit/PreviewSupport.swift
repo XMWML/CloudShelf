@@ -204,6 +204,7 @@ enum PreviewTemporaryFiles {
 final class RemotePreviewSidebar: NSView {
     private let titleLabel = NSTextField(labelWithString: "预览")
     private let statusLabel = NSTextField(labelWithString: "选择一个文件以预览")
+    private let loadingIndicator = NSProgressIndicator()
     private let contentHolder = NSView()
     private var previewTask: Task<Void, Never>?
     private var previewToken = UUID()
@@ -230,6 +231,8 @@ final class RemotePreviewSidebar: NSView {
         clearContent()
         titleLabel.stringValue = AppLocalization.shared.text("预览")
         statusLabel.stringValue = AppLocalization.shared.text("选择一个文件以预览")
+        loadingIndicator.stopAnimation(nil)
+        loadingIndicator.isHidden = true
     }
 
     func show(item: RemoteItem?, client: (any RemoteClient)?) {
@@ -265,16 +268,22 @@ final class RemotePreviewSidebar: NSView {
             statusLabel.stringValue = AppLocalization.shared.text("此扩展名未在预览设置中启用")
             return
         }
+        loadingIndicator.isHidden = false
+        loadingIndicator.startAnimation(nil)
         previewTask = Task { [weak self] in
             do {
                 let destination = try PreviewTemporaryFiles.destination(for: item.name)
                 try await client.download(item, to: destination)
                 guard !Task.isCancelled, let self, self.previewToken == token else { return }
+                self.loadingIndicator.stopAnimation(nil)
+                self.loadingIndicator.isHidden = true
                 self.render(kind: kind, url: destination, size: size)
             } catch is CancellationError {
                 return
             } catch {
                 guard let self, self.previewToken == token else { return }
+                self.loadingIndicator.stopAnimation(nil)
+                self.loadingIndicator.isHidden = true
                 self.statusLabel.stringValue = AppLocalization.shared.text("预览失败") + ": \(error.localizedDescription)"
             }
         }
@@ -288,9 +297,17 @@ final class RemotePreviewSidebar: NSView {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.maximumNumberOfLines = 3
+        loadingIndicator.style = .spinning
+        loadingIndicator.controlSize = .small
+        loadingIndicator.isDisplayedWhenStopped = false
+        loadingIndicator.isHidden = true
         contentHolder.translatesAutoresizingMaskIntoConstraints = false
 
-        let header = NSStackView(views: [titleLabel, statusLabel])
+        let statusRow = NSStackView(views: [loadingIndicator, statusLabel])
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 6
+        let header = NSStackView(views: [titleLabel, statusRow])
         header.orientation = .vertical
         header.alignment = .leading
         header.spacing = 4
@@ -417,23 +434,33 @@ final class SettingsWindowController: NSWindowController {
     private let concurrency = NSPopUpButton()
     private let askDownloadLocationEachTime = NSButton(checkboxWithTitle: "每次下载时询问位置", target: nil, action: nil)
     private let defaultDownloadLocation = NSTextField(labelWithString: "")
+    private let automaticConnectServer = NSPopUpButton()
     private let tabView = NSTabView()
     private var extensionButtons: [ExtensionGroup: [String: NSButton]] = [:]
     private var pendingDefaultDownloadDirectoryPath: String?
     private let makeSyncContent: () -> NSView
     private let currentConcurrency: () -> Int
     private let updateConcurrency: (Int) -> Void
+    private let connectionProfiles: () -> [ConnectionProfile]
+    private let currentAutomaticConnectProfileID: () -> UUID?
+    private let updateAutomaticConnectProfile: (UUID?) -> Void
     private let didSave: () -> Void
 
     init(
         makeSyncContent: @escaping () -> NSView,
         currentConcurrency: @escaping () -> Int,
         updateConcurrency: @escaping (Int) -> Void,
+        connectionProfiles: @escaping () -> [ConnectionProfile],
+        currentAutomaticConnectProfileID: @escaping () -> UUID?,
+        updateAutomaticConnectProfile: @escaping (UUID?) -> Void,
         didSave: @escaping () -> Void
     ) {
         self.makeSyncContent = makeSyncContent
         self.currentConcurrency = currentConcurrency
         self.updateConcurrency = updateConcurrency
+        self.connectionProfiles = connectionProfiles
+        self.currentAutomaticConnectProfileID = currentAutomaticConnectProfileID
+        self.updateAutomaticConnectProfile = updateAutomaticConnectProfile
         self.didSave = didSave
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
@@ -479,6 +506,9 @@ final class SettingsWindowController: NSWindowController {
             otherTextExtensions: otherTextExtensions.stringValue
         )
         updateConcurrency(Int(concurrency.titleOfSelectedItem ?? "3") ?? 3)
+        let selectedIndex = automaticConnectServer.indexOfSelectedItem
+        let profiles = connectionProfiles()
+        updateAutomaticConnectProfile(selectedIndex > 0 && selectedIndex - 1 < profiles.count ? profiles[selectedIndex - 1].id : nil)
         PreviewPreferences.shared.updateDownloadPreferences(
             directoryPath: pendingDefaultDownloadDirectoryPath,
             askEachTime: askDownloadLocationEachTime.state == .on
@@ -526,6 +556,12 @@ final class SettingsWindowController: NSWindowController {
         concurrency.addItems(withTitles: ["1", "2", "3", "4", "6", "8"])
         concurrency.selectItem(withTitle: String(currentConcurrency()))
         if concurrency.indexOfSelectedItem < 0 { concurrency.selectItem(withTitle: "3") }
+        automaticConnectServer.addItem(withTitle: "不自动连接")
+        let profiles = connectionProfiles()
+        automaticConnectServer.addItems(withTitles: profiles.map(\.name))
+        if let id = currentAutomaticConnectProfileID(), let index = profiles.firstIndex(where: { $0.id == id }) {
+            automaticConnectServer.selectItem(at: index + 1)
+        }
         languagePopup.addItems(withTitles: AppLanguage.allCases.map(\.displayName))
         languagePopup.selectItem(at: AppLanguage.allCases.firstIndex(of: AppLocalization.shared.language) ?? 0)
     }
@@ -642,7 +678,11 @@ final class SettingsWindowController: NSWindowController {
         locationRow.orientation = .horizontal
         locationRow.alignment = .centerY
         locationRow.spacing = 12
-        let stack = NSStackView(views: [title, row, askDownloadLocationEachTime, locationRow, description])
+        let automaticConnectRow = NSStackView(views: [NSTextField(labelWithString: "启动时自动连接"), automaticConnectServer])
+        automaticConnectRow.orientation = .horizontal
+        automaticConnectRow.spacing = 12
+        automaticConnectRow.arrangedSubviews[0].setContentHuggingPriority(.required, for: .horizontal)
+        let stack = NSStackView(views: [title, row, askDownloadLocationEachTime, locationRow, automaticConnectRow, description])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14

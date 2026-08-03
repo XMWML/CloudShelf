@@ -2,6 +2,14 @@
 
 All notable changes to CloudShelf are documented here.
 
+## 1.2.0 - 2026-08-03
+
+### Added
+
+- Native loading indicators while connecting to a server, loading a remote folder, or downloading a file preview.
+- A Cancel action for paused transfer tasks; cancelled tasks can be removed with the existing clear-finished command.
+- A Transfers setting to select one saved server that CloudShelf connects automatically when it launches.
+
 ## 1.1.0 - 2026-08-03
 
 ### Added

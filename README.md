@@ -21,11 +21,11 @@ CloudShelf is a native macOS FTP, SFTP, and WebDAV workspace manager. It present
 - Store SFTP host fingerprints in CloudShelf's own `known_hosts` file. Choose either strict checking or accepting a host key on first connection.
 - Add, edit, enable, disable, remove, and run multiple local-folder sync rules per connection. Each rule independently selects local upload, remote download, local deletion to remote, and remote deletion to local; select remote folders from the server browser and optionally trigger rules after local changes.
 - Use the toolbar's global automatic-sync switch to pause or resume all scheduled and local-change-triggered rules without stopping an active transfer. Manual sync remains available.
-- Queue uploads, downloads, remote copies, moves, and syncs with a configurable 1-8 task concurrency limit. Pause, resume, retry, or clear individual tasks; start, stop, retry failed, or clear finished tasks in bulk.
+- Queue uploads, downloads, remote copies, moves, and syncs with a configurable 1-8 task concurrency limit. Pause, resume, cancel paused tasks, retry, or clear individual tasks; start, stop, retry failed, or clear finished tasks in bulk.
 
 ## Settings and preview
 
-Choose **Settings > Open Settings** to switch between Preview, Transfers, and Sync tabs. The Preview tab also has a language selector with **Follow System** as the default, plus Chinese and English overrides. It enables or disables each common extension independently, accepts custom image/video/audio extensions, and has an Other text rule. Enter `*` in that rule to treat every otherwise-unselected extension as text. The Transfers tab configures 1-8 concurrent tasks, a default download directory, and whether to ask for a destination each time. The Sync tab manages the selected connection's rules directly.
+Choose **Settings > Open Settings** to switch between Preview, Transfers, and Sync tabs. The Preview tab also has a language selector with **Follow System** as the default, plus Chinese and English overrides. It enables or disables each common extension independently, accepts custom image/video/audio extensions, and has an Other text rule. Enter `*` in that rule to treat every otherwise-unselected extension as text. The Transfers tab configures 1-8 concurrent tasks, a default download directory, whether to ask for a destination each time, and one server to auto-connect when the app launches. The Sync tab manages the selected connection's rules directly.
 
 The selected file is downloaded only when the preview pane is visible and preview is enabled. Temporary preview and double-click downloads are kept in an app-owned temporary directory and cleared on the next launch.
 

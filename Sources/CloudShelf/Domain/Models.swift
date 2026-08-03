@@ -211,6 +211,7 @@ public enum TransferStatus: String, Sendable, Equatable {
     case paused
     case succeeded
     case failed
+    case cancelled
 }
 
 public struct TransferTask: Identifiable, Sendable, Equatable {

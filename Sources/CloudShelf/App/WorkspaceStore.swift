@@ -266,19 +266,28 @@ final class WorkspaceStore: ObservableObject {
     private var queuedTransferIDs: [UUID] = []
     private var runningTransferTasks: [UUID: Task<Void, Never>] = [:]
     private var pausedTransferIDs = Set<UUID>()
+    private var cancelledTransferIDs = Set<UUID>()
     private var resumeAfterCancellationIDs = Set<UUID>()
     private var resumableTransferIDs = Set<UUID>()
     private var isTransferQueuePaused = false
     private static let automaticSyncEnabledKey = "CloudShelf.automaticSyncEnabled"
     private static let maximumConcurrentTransfersKey = "CloudShelf.maximumConcurrentTransfers"
+    private static let automaticConnectProfileIDKey = "CloudShelf.automaticConnectProfileID"
+    @Published private(set) var automaticConnectProfileID: UUID?
 
     init() {
         automaticSyncEnabled = UserDefaults.standard.object(forKey: Self.automaticSyncEnabledKey) as? Bool ?? true
         maximumConcurrentTransfers = Self.validConcurrentTransferCount(
             UserDefaults.standard.object(forKey: Self.maximumConcurrentTransfersKey) as? Int ?? 3
         )
+        automaticConnectProfileID = UserDefaults.standard.string(forKey: Self.automaticConnectProfileIDKey).flatMap(UUID.init(uuidString:))
         Task {
             profiles = await profileStore.load().sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            if let id = automaticConnectProfileID, let profile = profile(id: id) {
+                await mount(profile)
+            } else if automaticConnectProfileID != nil {
+                setAutomaticConnectProfile(nil)
+            }
         }
         syncTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.runScheduledSyncs() }
@@ -303,6 +312,15 @@ final class WorkspaceStore: ObservableObject {
         startQueuedTransfers()
     }
 
+    func setAutomaticConnectProfile(_ id: UUID?) {
+        automaticConnectProfileID = id
+        if let id {
+            UserDefaults.standard.set(id.uuidString, forKey: Self.automaticConnectProfileIDKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.automaticConnectProfileIDKey)
+        }
+    }
+
     func pauseTransfer(_ id: UUID) {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
         switch transfers[index].status {
@@ -321,9 +339,21 @@ final class WorkspaceStore: ObservableObject {
             resumeAfterCancellationIDs.remove(id)
             pausedTransferIDs.insert(id)
             runningTransferTasks[id]?.cancel()
-        case .succeeded, .failed:
+        case .succeeded, .failed, .cancelled:
             return
         }
+    }
+
+    func cancelTransfer(_ id: UUID) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }),
+              transfers[index].status == .paused else { return }
+        queuedTransferIDs.removeAll { $0 == id }
+        pausedTransferIDs.remove(id)
+        resumeAfterCancellationIDs.remove(id)
+        resumableTransferIDs.remove(id)
+        cancelledTransferIDs.insert(id)
+        updateTransfer(id, status: .cancelled, detail: "已取消", finishedAt: .now)
+        runningTransferTasks[id]?.cancel()
     }
 
     func resumeTransfer(_ id: UUID) {
@@ -379,7 +409,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func clearFinishedTransfers() {
-        let removable = Set(transfers.filter { $0.status == .succeeded || $0.status == .failed }.map(\.id))
+        let removable = Set(transfers.filter { $0.status == .succeeded || $0.status == .failed || $0.status == .cancelled }.map(\.id))
         transfers.removeAll { removable.contains($0.id) }
         removable.forEach {
             transferJobs.removeValue(forKey: $0)
@@ -389,6 +419,7 @@ final class WorkspaceStore: ObservableObject {
             resumableTransferIDs.remove($0)
             pausedTransferIDs.remove($0)
             resumeAfterCancellationIDs.remove($0)
+            cancelledTransferIDs.remove($0)
         }
     }
 
@@ -433,6 +464,7 @@ final class WorkspaceStore: ObservableObject {
     func delete(profile: ConnectionProfile) async {
         sessions.removeValue(forKey: profile.id)
         profiles.removeAll { $0.id == profile.id }
+        if automaticConnectProfileID == profile.id { setAutomaticConnectProfile(nil) }
         CredentialStore.delete(profileID: profile.id)
         profile.syncRules.forEach { rule in
             clearChangeTracking(for: rule.id)
@@ -579,6 +611,10 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func markTransferPausedIfCancelled(_ id: UUID) -> Bool {
+        if cancelledTransferIDs.contains(id) {
+            updateTransfer(id, status: .cancelled, detail: "已取消", finishedAt: .now)
+            return true
+        }
         guard Task.isCancelled || pausedTransferIDs.contains(id) else { return false }
         pausedTransferIDs.insert(id)
         resumableTransferIDs.insert(id)
