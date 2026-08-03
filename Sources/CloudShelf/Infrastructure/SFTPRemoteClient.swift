@@ -1,5 +1,39 @@
 import Foundation
 
+private final class SFTPProgressParser: @unchecked Sendable {
+    private let totalBytes: Int64
+    private let progress: TransferProgressHandler
+    private let lock = NSLock()
+    private var unfinishedLine = ""
+    private var lastCompletedBytes: Int64 = 0
+
+    init(totalBytes: Int64, progress: @escaping TransferProgressHandler) {
+        self.totalBytes = totalBytes
+        self.progress = progress
+    }
+
+    func consume(_ data: Data) {
+        let chunk = String(decoding: data, as: UTF8.self)
+        lock.lock()
+        let text = unfinishedLine + chunk
+        let lines = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\r" || $0 == "\n" })
+        let hasTerminator = text.last == "\r" || text.last == "\n"
+        unfinishedLine = hasTerminator ? "" : String(lines.last ?? "")
+        let completedLines = hasTerminator ? lines : lines.dropLast()
+        var completedValues = [Int64]()
+        for line in completedLines {
+            guard let percentageToken = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).first(where: { $0.hasSuffix("%") }),
+                  let percentage = Double(percentageToken.dropLast()) else { continue }
+            let completed = min(totalBytes, max(lastCompletedBytes, Int64((percentage / 100) * Double(totalBytes))))
+            guard completed > lastCompletedBytes else { continue }
+            lastCompletedBytes = completed
+            completedValues.append(completed)
+        }
+        lock.unlock()
+        completedValues.forEach { progress($0, totalBytes) }
+    }
+}
+
 actor SFTPRemoteClient: RemoteClient {
     private let profile: ConnectionProfile
     private let endpoint: RemoteEndpoint
@@ -22,48 +56,76 @@ actor SFTPRemoteClient: RemoteClient {
     }
 
     func list(at path: String) async throws -> [RemoteItem] {
-        let output = try execute(["ls -la \(quoted(endpoint.serverPath(for: path)))"])
+        let output = try await execute(["ls -la \(quoted(endpoint.serverPath(for: path)))"])
         return UnixListingParser.parse(output.stdout, parent: RemotePath.normalized(path))
     }
 
     func createDirectory(named name: String, in parent: String) async throws {
         try validateName(name)
-        _ = try execute(["mkdir \(quoted(endpoint.serverPath(for: RemotePath.join(parent, name))))"])
+        _ = try await execute(["mkdir \(quoted(endpoint.serverPath(for: RemotePath.join(parent, name))))"])
     }
 
     func delete(_ item: RemoteItem) async throws {
         if item.isDirectory {
             for child in try await list(at: item.path) { try await delete(child) }
-            _ = try execute(["rmdir \(quoted(endpoint.serverPath(for: item.path)))"])
+            _ = try await execute(["rmdir \(quoted(endpoint.serverPath(for: item.path)))"])
         } else {
-            _ = try execute(["rm \(quoted(endpoint.serverPath(for: item.path)))"])
+            _ = try await execute(["rm \(quoted(endpoint.serverPath(for: item.path)))"])
         }
     }
 
     func rename(_ item: RemoteItem, to newName: String) async throws {
         try validateName(newName)
         let destination = RemotePath.join(RemotePath.parent(of: item.path), newName)
-        _ = try execute(["rename \(quoted(endpoint.serverPath(for: item.path))) \(quoted(endpoint.serverPath(for: destination)))"])
+        _ = try await execute(["rename \(quoted(endpoint.serverPath(for: item.path))) \(quoted(endpoint.serverPath(for: destination)))"])
     }
 
     func move(_ item: RemoteItem, to directory: String) async throws {
         let destination = RemotePath.join(directory, item.name)
-        _ = try execute(["rename \(quoted(endpoint.serverPath(for: item.path))) \(quoted(endpoint.serverPath(for: destination)))"])
+        _ = try await execute(["rename \(quoted(endpoint.serverPath(for: item.path))) \(quoted(endpoint.serverPath(for: destination)))"])
     }
 
     func download(_ item: RemoteItem, to localURL: URL) async throws {
+        try await download(item, to: localURL, resumeFrom: 0, progress: nil)
+    }
+
+    func supportsResumableTransfers() async -> Bool { true }
+
+    func download(_ item: RemoteItem, to localURL: URL, resumeFrom: Int64, progress: TransferProgressHandler?) async throws {
         try FileManager.default.createDirectory(at: localURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        _ = try execute(["get -p \(quoted(endpoint.serverPath(for: item.path))) \(quoted(localURL.path))"])
+        let command = resumeFrom > 0 ? "reget -p" : "get -p"
+        _ = try await execute(
+            ["\(command) \(quoted(endpoint.serverPath(for: item.path))) \(quoted(localURL.path))"],
+            progress: progress,
+            totalBytes: item.size
+        )
     }
 
     func upload(_ localURL: URL, to directory: String) async throws {
-        let target = RemotePath.join(directory, localURL.lastPathComponent)
-        let resourceValues = try localURL.resourceValues(forKeys: [.isDirectoryKey])
-        let command = resourceValues.isDirectory == true ? "put -pr" : "put -p"
-        _ = try execute(["\(command) \(quoted(localURL.path)) \(quoted(endpoint.serverPath(for: target)))"])
+        try await upload(localURL, to: directory, resumeFrom: 0, progress: nil)
     }
 
-    private func execute(_ commands: [String]) throws -> ProcessOutput {
+    func upload(_ localURL: URL, to directory: String, resumeFrom: Int64, progress: TransferProgressHandler?) async throws {
+        let target = RemotePath.join(directory, localURL.lastPathComponent)
+        let resourceValues = try localURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+        let command: String
+        if resourceValues.isDirectory == true {
+            command = "put -pr"
+        } else {
+            command = resumeFrom > 0 ? "reput -p" : "put -p"
+        }
+        _ = try await execute(
+            ["\(command) \(quoted(localURL.path)) \(quoted(endpoint.serverPath(for: target)))"],
+            progress: progress,
+            totalBytes: resourceValues.isDirectory == true ? nil : Int64(resourceValues.fileSize ?? 0)
+        )
+    }
+
+    private func execute(
+        _ commands: [String],
+        progress: TransferProgressHandler? = nil,
+        totalBytes: Int64? = nil
+    ) async throws -> ProcessOutput {
         let batch = try TemporaryFiles.write(commands.joined(separator: "\n") + "\n", suffix: "sftp")
         defer { try? FileManager.default.removeItem(at: batch) }
 
@@ -71,7 +133,10 @@ actor SFTPRemoteClient: RemoteClient {
             "-P", String(profile.port),
             "-b", batch.path,
             "-o", "UserKnownHostsFile=\(knownHostsURL.path)",
-            "-o", "StrictHostKeyChecking=\(profile.hostKeyPolicy == .strict ? "yes" : "accept-new")"
+            "-o", "StrictHostKeyChecking=\(profile.hostKeyPolicy == .strict ? "yes" : "accept-new")",
+            "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3"
         ]
         var environment: [String: String] = [:]
         var secretURL: URL?
@@ -102,7 +167,15 @@ actor SFTPRemoteClient: RemoteClient {
 
         let destination = profile.username.isEmpty ? profile.host : "\(profile.username)@\(profile.host)"
         arguments.append(destination)
-        return try ProcessRunner.run(executable: URL(fileURLWithPath: "/usr/bin/sftp"), arguments: arguments, environment: environment)
+        let parser = progress.flatMap { progress in
+            totalBytes.flatMap { $0 > 0 ? SFTPProgressParser(totalBytes: $0, progress: progress) : nil }
+        }
+        return try await ProcessRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/sftp"),
+            arguments: arguments,
+            environment: environment,
+            onStandardErrorData: { data in parser?.consume(data) }
+        )
     }
 
     private func quoted(_ value: String) -> String {

@@ -133,8 +133,8 @@ actor WebDAVRemoteClient: RemoteClient {
     private static func sessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 300
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 3_600
         return configuration
     }
 

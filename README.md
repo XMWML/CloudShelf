@@ -10,12 +10,26 @@ CloudShelf is a native macOS FTP, SFTP, and WebDAV workspace manager. It present
 - Browse remote folders with directory navigation, sortable file-style columns, drag-and-drop upload, drag files out to Finder, and a transfer queue with progress and transfer rate.
 - Show a Linux-style `..` parent-directory entry at the top of every non-root folder.
 - Upload and download files and folders; folder uploads and downloads preserve the selected folder's hierarchy and empty folders; create folders; rename, copy, move, and recursively delete remote content.
+- Use the leftmost file-list checkboxes to select multiple remote items. `Command-A` selects every visible remote item (and runs again to clear them); file actions use checked items when any are checked, while normal table selection remains available when none are checked.
+- The connection sidebar shows each server's connection state and provides a contextual Connect, Disconnect, Cancel, or Reconnect action for the selected server.
 - Right-click remote files, folders, and connections for common actions. Inspect one selected remote item with `Command-I` to see its path, type, modified date, and size; folder sizes are calculated on demand.
+- Show or hide a right-side preview pane from **View > Show Preview Pane**. Selecting one file previews images, video, audio, PDF, and text; files over the configured size limit are not fetched for preview.
+- Double-click a remote file to download it into CloudShelf's temporary directory and open it with its default macOS app.
+- Toggle the left connection pane, right preview pane, and bottom transfer pane independently from the View menu or the file-list header controls.
 - Save passwords in macOS Keychain. Connection metadata is stored separately in Application Support.
 - Support SFTP password, SSH agent, and private-key authentication.
 - Store SFTP host fingerprints in CloudShelf's own `known_hosts` file. Choose either strict checking or accepting a host key on first connection.
 - Add, edit, enable, disable, remove, and run multiple local-folder sync rules per connection. Each rule independently selects local upload, remote download, local deletion to remote, and remote deletion to local; select remote folders from the server browser and optionally trigger rules after local changes.
 - Use the toolbar's global automatic-sync switch to pause or resume all scheduled and local-change-triggered rules without stopping an active transfer. Manual sync remains available.
+- Queue uploads, downloads, remote copies, moves, and syncs with a configurable 1-8 task concurrency limit. Pause, resume, retry, or clear individual tasks; start, stop, retry failed, or clear finished tasks in bulk.
+
+## Settings and preview
+
+Choose **Settings > Open Settings** to switch between Preview, Transfers, and Sync tabs. The Preview tab also has a language selector with **Follow System** as the default, plus Chinese and English overrides. It enables or disables each common extension independently, accepts custom image/video/audio extensions, and has an Other text rule. Enter `*` in that rule to treat every otherwise-unselected extension as text. The Transfers tab configures 1-8 concurrent tasks, a default download directory, and whether to ask for a destination each time. The Sync tab manages the selected connection's rules directly.
+
+The selected file is downloaded only when the preview pane is visible and preview is enabled. Temporary preview and double-click downloads are kept in an app-owned temporary directory and cleared on the next launch.
+
+Ordinary FTP and SFTP file tasks preserve partial progress when paused and continue from it when resumed. CloudShelf keeps each task's partial file private and serializes operations with the same target, so duplicate downloads cannot write the same local file concurrently. WebDAV is retried from the beginning unless the server explicitly provides a safe resumable transfer mechanism.
 
 ## No FUSE and no Finder mount API
 

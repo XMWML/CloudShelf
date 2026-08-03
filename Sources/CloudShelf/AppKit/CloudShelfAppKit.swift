@@ -7,6 +7,7 @@ final class CloudShelfApplication: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        try? PreviewTemporaryFiles.prepare()
         let controller = FileManagerWindowController()
         self.controller = controller
         controller.showWindow(nil)
@@ -39,6 +40,13 @@ private enum BrowserRow: Equatable {
     }
 }
 
+private enum ConnectionDisplayState: Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case failed
+}
+
 private final class RemoteFilePromise: NSObject, @unchecked Sendable {
     let item: RemoteItem
     let client: any RemoteClient
@@ -57,6 +65,14 @@ private final class FilePromiseCompletion: @unchecked Sendable {
     func finish(_ error: Error?) { handler(error) }
 }
 
+private final class TransferActionButton: NSButton {
+    var transferID: UUID?
+}
+
+private final class BrowserCheckboxButton: NSButton {
+    var itemIdentifier: String?
+}
+
 @MainActor
 final class FileManagerWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSToolbarDelegate, NSFilePromiseProviderDelegate {
     fileprivate let store = WorkspaceStore()
@@ -65,6 +81,8 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     fileprivate let transferTable = NSTableView()
     fileprivate let pathLabel = NSTextField(labelWithString: "/")
     fileprivate let connectionStatus = NSTextField(labelWithString: "未选择连接")
+    fileprivate let sidebarConnectionStatus = NSTextField(labelWithString: "未选择连接")
+    fileprivate let connectionToggleButton = NSButton(title: "连接", target: nil, action: nil)
     private var selectedProfileID: UUID?
     private var session: RemoteSession?
     private var refreshTimer: Timer?
@@ -74,13 +92,20 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     private var presentingError = false
     private var lastSessionError: String?
     private var displayedProfiles: [ConnectionProfile] = []
+    private var displayedConnectionStates: [UUID: ConnectionDisplayState] = [:]
     private var displayedSessionID: UUID?
     private var displayedRows: [BrowserRow] = []
     private var displayedTransfers: [TransferTask] = []
+    private var displayedTransferIDs: [UUID] = []
+    private var checkedItemIdentifiers = Set<String>()
     private var restoringConnectionSelection = false
     private var propertiesWindowController: RemoteItemPropertiesWindowController?
-    private var syncRulesWindowController: SyncRulesWindowController?
+    private var settingsWindowController: SettingsWindowController?
+    private weak var fileManagerViewController: FileManagerViewController?
     private weak var automaticSyncToolbarItem: NSToolbarItem?
+    private weak var previewMenuItem: NSMenuItem?
+    private weak var selectAllMenuItem: NSMenuItem?
+    private var languageObserver: NSObjectProtocol?
 
     init() {
         let window = NSWindow(
@@ -93,9 +118,23 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         window.minSize = NSSize(width: 980, height: 620)
         super.init(window: window)
         window.center()
-        window.contentViewController = FileManagerViewController(owner: self)
+        let viewController = FileManagerViewController(owner: self)
+        fileManagerViewController = viewController
+        window.contentViewController = viewController
+        if let contentView = window.contentView {
+            AppLocalization.shared.localize(view: contentView)
+        }
         configureMainMenu()
         configureToolbar()
+        connectionToggleButton.target = self
+        connectionToggleButton.action = #selector(toggleConnectionAction)
+        languageObserver = NotificationCenter.default.addObserver(
+            forName: AppLocalization.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.rebuildLocalizedInterface() }
+        }
         refreshTimer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(refreshViews), userInfo: nil, repeats: true)
     }
 
@@ -111,6 +150,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         let identifier = tableColumn?.identifier.rawValue ?? ""
         let text: String
         let icon: NSImage?
+        let localizeText: Bool
         if tableView === connectionTable {
             let profile = store.profiles[row]
             switch identifier {
@@ -118,8 +158,16 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             case "protocol": text = profile.protocolType.rawValue
             default: text = ""
             }
+            if identifier == "state" {
+                return connectionStateCell(for: profile)
+            }
+            localizeText = false
             icon = symbol(profile.protocolType == .sftp ? "lock.shield" : "externaldrive.connected.to.line.below")
         } else if tableView === browserTable, row >= 0, row < browserRows.count {
+            if identifier == "selection" {
+                return browserSelectionCell(row: row)
+            }
+            localizeText = identifier == "type"
             switch browserRows[row] {
             case .parentDirectory:
                 switch identifier {
@@ -141,19 +189,26 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         } else {
             let transfer = displayedTransfers[row]
             if identifier == "progress" { return transferProgressCell(transfer) }
+            if identifier == "actions" { return transferActionCell(transfer) }
             switch identifier {
             case "transfer": text = transfer.title
-            case "state": text = "\(transfer.connectionName) - \(transfer.detail)"
+            case "state": text = "\(transfer.connectionName) - \(AppLocalization.shared.status(transfer.detail))"
             case "speed": text = transferSpeedDescription(transfer)
             default: text = ""
             }
+            localizeText = false
             icon = identifier == "transfer" ? symbol(transfer.status == .failed ? "xmark.circle.fill" : transfer.status == .succeeded ? "checkmark.circle.fill" : "arrow.left.arrow.right") : nil
         }
-        return cell(identifier: NSUserInterfaceItemIdentifier("cell-\(identifier)"), text: text, image: icon)
+        return cell(identifier: NSUserInterfaceItemIdentifier("cell-\(identifier)"), text: text, image: icon, localize: localizeText)
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
-        guard notification.object as? NSTableView === connectionTable else { return }
+        guard let tableView = notification.object as? NSTableView else { return }
+        if tableView === browserTable {
+            updatePreview()
+            return
+        }
+        guard tableView === connectionTable else { return }
         guard !restoringConnectionSelection else { return }
         let row = connectionTable.selectedRow
         guard row >= 0, row < store.profiles.count else { return }
@@ -162,8 +217,10 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         Task { [weak self] in
             await self?.store.mount(profile)
             guard let self else { return }
+            guard self.selectedProfileID == profile.id else { return }
             self.session = self.store.sessions[profile.id]
             self.refreshViews()
+            self.updatePreview()
         }
     }
 
@@ -238,14 +295,29 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     @objc func openSelectedItem() {
-        guard selectedBrowserRows.count == 1, let row = selectedBrowserRows.first, let session else { return }
+        guard let session else { return }
+        if !checkedItemIdentifiers.isEmpty {
+            guard selectedItems.count == 1, let item = selectedItems.first else { return }
+            Task { [weak self] in
+                if item.isDirectory {
+                    await session.open(item)
+                    self?.refreshViews()
+                } else {
+                    await self?.downloadAndOpenTemporarily(item, from: session)
+                }
+            }
+            return
+        }
+
+        guard selectedBrowserRows.count == 1, let row = selectedBrowserRows.first else { return }
         Task { [weak self] in
             switch row {
             case .parentDirectory:
                 await session.goUp()
             case .item(let item) where item.isDirectory:
                 await session.open(item)
-            case .item:
+            case .item(let item):
+                await self?.downloadAndOpenTemporarily(item, from: session)
                 return
             }
             self?.refreshViews()
@@ -257,17 +329,43 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         reloadBrowserTableIfNeeded()
         reloadTransferTableIfNeeded()
         pathLabel.stringValue = session?.location ?? "/"
-        if let session {
-            connectionStatus.stringValue = "\(session.profile.name)  |  \(session.profile.protocolType.rawValue)  |  \(session.isLoading ? "正在加载" : "已连接")"
+        if let profile = selectedProfile {
+            let state = connectionDisplayState(for: profile)
+            connectionStatus.stringValue = "\(profile.name)  |  \(profile.protocolType.rawValue)  |  \(connectionStateDescription(state))"
         } else {
-            connectionStatus.stringValue = "未选择连接"
+            connectionStatus.stringValue = AppLocalization.shared.text("未选择连接")
         }
+        updateConnectionSidebarControls()
         showErrorIfNeeded()
     }
 
+    private func rebuildLocalizedInterface() {
+        settingsWindowController?.close()
+        for table in [connectionTable, browserTable, transferTable] {
+            table.tableColumns.forEach { table.removeTableColumn($0) }
+        }
+        displayedProfiles = []
+        displayedConnectionStates = [:]
+        displayedSessionID = nil
+        displayedRows = []
+        displayedTransfers = []
+        displayedTransferIDs = []
+        let viewController = FileManagerViewController(owner: self)
+        fileManagerViewController = viewController
+        window?.contentViewController = viewController
+        configureMainMenu()
+        configureToolbar()
+        if let contentView = window?.contentView {
+            AppLocalization.shared.localize(view: contentView)
+        }
+        refreshViews()
+    }
+
     private func reloadConnectionTableIfNeeded() {
-        guard displayedProfiles != store.profiles else { return }
+        let currentStates = Dictionary(uniqueKeysWithValues: store.profiles.map { ($0.id, connectionDisplayState(for: $0)) })
+        guard displayedProfiles != store.profiles || displayedConnectionStates != currentStates else { return }
         displayedProfiles = store.profiles
+        displayedConnectionStates = currentStates
         connectionTable.reloadData()
 
         guard let selectedProfileID,
@@ -283,18 +381,36 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         let currentRows = browserRows
         guard displayedSessionID != currentSessionID || displayedRows != currentRows else { return }
         let selectedIdentifiers = displayedSessionID == currentSessionID ? selectedBrowserRows.map(\.identifier) : []
+        let visibleItemIdentifiers = Set(currentRows.compactMap { $0.item?.path })
+        if displayedSessionID != currentSessionID {
+            checkedItemIdentifiers.removeAll()
+        } else {
+            checkedItemIdentifiers.formIntersection(visibleItemIdentifiers)
+        }
         displayedSessionID = currentSessionID
         displayedRows = currentRows
         browserTable.reloadData()
         let selectedRows = IndexSet(currentRows.indices.filter { selectedIdentifiers.contains(currentRows[$0].identifier) })
         browserTable.selectRowIndexes(selectedRows, byExtendingSelection: false)
+        updatePreview()
+        updateSelectAllMenuItem()
     }
 
     private func reloadTransferTableIfNeeded() {
-        let currentTransfers = Array(store.transfers.suffix(8).reversed())
-        guard displayedTransfers != currentTransfers else { return }
+        let currentTransfers = Array(store.transfers.reversed())
+        let currentIDs = currentTransfers.map(\.id)
+        guard displayedTransferIDs == currentIDs else {
+            displayedTransferIDs = currentIDs
+            displayedTransfers = currentTransfers
+            transferTable.reloadData()
+            return
+        }
+
+        let changedRows = IndexSet(currentTransfers.indices.filter { displayedTransfers[$0] != currentTransfers[$0] })
+        guard !changedRows.isEmpty else { return }
         displayedTransfers = currentTransfers
-        transferTable.reloadData()
+        let columns = IndexSet(integersIn: 0..<transferTable.numberOfColumns)
+        transferTable.reloadData(forRowIndexes: changedRows, columnIndexes: columns)
     }
 
     func addConnection() {
@@ -364,9 +480,14 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func connectSelected() {
         guard let profile = selectedProfile else { return }
+        if connectionDisplayState(for: profile) == .failed {
+            store.unmount(profile)
+            if session?.profile.id == profile.id { session = nil }
+        }
         Task { [weak self] in
             guard let self else { return }
             await self.store.mount(profile)
+            guard self.selectedProfileID == profile.id else { return }
             self.session = self.store.sessions[profile.id]
             self.refreshViews()
         }
@@ -375,8 +496,18 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func disconnectSelected() {
         guard let profile = selectedProfile else { return }
         store.unmount(profile)
-        session = nil
+        if session?.profile.id == profile.id { session = nil }
         refreshViews()
+    }
+
+    func toggleSelectedConnection() {
+        guard let profile = selectedProfile else { return }
+        switch connectionDisplayState(for: profile) {
+        case .connected, .connecting:
+            disconnectSelected()
+        case .disconnected, .failed:
+            connectSelected()
+        }
     }
 
     func newFolder() {
@@ -425,12 +556,24 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func chooseDownloads() {
         let items = selectedItems
         guard !items.isEmpty, let session else { return }
+
+        let preferences = PreviewPreferences.shared
+        if !preferences.askDownloadLocationEachTime,
+           let path = preferences.defaultDownloadDirectoryPath,
+           Self.isDirectory(atPath: path) {
+            store.download(items, to: URL(fileURLWithPath: path, isDirectory: true), from: session)
+            return
+        }
+
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "下载到此处"
+        if let path = preferences.defaultDownloadDirectoryPath, Self.isDirectory(atPath: path) {
+            panel.directoryURL = URL(fileURLWithPath: path, isDirectory: true)
+        }
         panel.beginSheetModal(for: window!) { [weak self] response in
             guard response == .OK, let destination = panel.url, let self else { return }
             self.store.download(items, to: destination, from: session)
@@ -441,12 +584,26 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     func moveItems() { moveOrCopy(isMove: true) }
 
     func configureSync() {
-        guard let profile = selectedProfile, let session else {
-            presentError("请先连接服务器，再配置同步规则。")
-            return
-        }
-        syncRulesWindowController?.close()
-        let controller = SyncRulesWindowController(
+        showSettings(selectingSyncTab: true)
+    }
+
+    func showSettings(selectingSyncTab: Bool = false) {
+        settingsWindowController?.close()
+        let controller = SettingsWindowController(
+            makeSyncContent: { [weak self] in self?.makeSyncSettingsContent() ?? SettingsPlaceholderView() },
+            currentConcurrency: { [weak self] in self?.store.maximumConcurrentTransfers ?? 3 },
+            updateConcurrency: { [weak self] count in self?.store.setMaximumConcurrentTransfers(count) },
+            didSave: { [weak self] in self?.updatePreview() }
+        )
+        settingsWindowController = controller
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        if selectingSyncTab { controller.selectSyncTab() }
+    }
+
+    private func makeSyncSettingsContent() -> NSView? {
+        guard let profile = selectedProfile, let session else { return nil }
+        return SyncRulesSettingsView(
             profile: profile,
             session: session,
             saveRules: { [weak self] rules in
@@ -462,9 +619,6 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
                 self.store.sync(profile: latest, rule: rule)
             }
         )
-        syncRulesWindowController = controller
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
     }
 
     func runSync() {
@@ -491,6 +645,49 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         selectedProfileID.flatMap { store.profile(id: $0) }
     }
 
+    private func connectionDisplayState(for profile: ConnectionProfile) -> ConnectionDisplayState {
+        guard let session = store.sessions[profile.id] else { return .disconnected }
+        if session.errorMessage != nil { return .failed }
+        return session.isLoading ? .connecting : .connected
+    }
+
+    private func connectionStateDescription(_ state: ConnectionDisplayState) -> String {
+        switch state {
+        case .disconnected: return AppLocalization.shared.text("已断开")
+        case .connecting: return AppLocalization.shared.text("正在连接")
+        case .connected: return AppLocalization.shared.text("已连接")
+        case .failed: return AppLocalization.shared.text("连接失败")
+        }
+    }
+
+    private func updateConnectionSidebarControls() {
+        guard let profile = selectedProfile else {
+            sidebarConnectionStatus.stringValue = AppLocalization.shared.text("未选择连接")
+            connectionToggleButton.title = AppLocalization.shared.label("connect")
+            connectionToggleButton.toolTip = AppLocalization.shared.text("选择一个连接后即可连接")
+            connectionToggleButton.isEnabled = false
+            return
+        }
+
+        let state = connectionDisplayState(for: profile)
+        sidebarConnectionStatus.stringValue = "\(profile.name)：\(connectionStateDescription(state))"
+        connectionToggleButton.isEnabled = true
+        switch state {
+        case .connected:
+            connectionToggleButton.title = AppLocalization.shared.label("disconnect")
+            connectionToggleButton.toolTip = AppLocalization.shared.label("disconnect") + " \(profile.name)"
+        case .connecting:
+            connectionToggleButton.title = AppLocalization.shared.label("cancelConnection")
+            connectionToggleButton.toolTip = AppLocalization.shared.label("cancelConnection") + " \(profile.name)"
+        case .disconnected:
+            connectionToggleButton.title = AppLocalization.shared.label("connect")
+            connectionToggleButton.toolTip = AppLocalization.shared.label("connect") + " \(profile.name)"
+        case .failed:
+            connectionToggleButton.title = AppLocalization.shared.label("reconnect")
+            connectionToggleButton.toolTip = AppLocalization.shared.label("reconnect") + " \(profile.name)"
+        }
+    }
+
     private var browserRows: [BrowserRow] {
         guard let session else { return [] }
         let items = session.items.map(BrowserRow.item)
@@ -505,7 +702,35 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     }
 
     private var selectedItems: [RemoteItem] {
-        selectedBrowserRows.compactMap(\.item)
+        let checkedItems = browserRows.compactMap { row -> RemoteItem? in
+            guard let item = row.item, checkedItemIdentifiers.contains(item.path) else { return nil }
+            return item
+        }
+        return checkedItems.isEmpty ? selectedBrowserRows.compactMap(\.item) : checkedItems
+    }
+
+    private var selectableBrowserItemIdentifiers: Set<String> {
+        Set(browserRows.compactMap { $0.item?.path })
+    }
+
+    private var areAllVisibleItemsChecked: Bool {
+        let itemIdentifiers = selectableBrowserItemIdentifiers
+        return !itemIdentifiers.isEmpty && itemIdentifiers.isSubset(of: checkedItemIdentifiers)
+    }
+
+    private func updatePreview() {
+        let item = selectedItems.count == 1 ? selectedItems[0] : nil
+        fileManagerViewController?.showPreview(item: item, client: session?.client)
+    }
+
+    private func downloadAndOpenTemporarily(_ item: RemoteItem, from session: RemoteSession) async {
+        do {
+            let destination = try PreviewTemporaryFiles.destination(for: item.name)
+            try await session.client.download(item, to: destination)
+            NSWorkspace.shared.open(destination)
+        } catch {
+            store.lastError = "打开 \(item.name) 失败：\(error.localizedDescription)"
+        }
     }
 
     private func browserContextMenu() -> NSMenu {
@@ -558,7 +783,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         key: String = "",
         enabled: Bool
     ) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        let item = NSMenuItem(title: AppLocalization.shared.text(title), action: action, keyEquivalent: key)
         if !key.isEmpty { item.keyEquivalentModifierMask = [.command] }
         item.target = self
         item.isEnabled = enabled
@@ -586,9 +811,9 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         guard let window else { return }
         presentingError = true
         let alert = NSAlert()
-        alert.messageText = "操作失败"
-        alert.informativeText = message
-        alert.addButton(withTitle: "好")
+        alert.messageText = AppLocalization.shared.text("操作失败")
+        alert.informativeText = AppLocalization.shared.text(message)
+        alert.addButton(withTitle: AppLocalization.shared.text("好"))
         alert.beginSheetModal(for: window) { [weak self] _ in
             self?.presentingError = false
             completion?()
@@ -648,8 +873,19 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
 
     func selectAll() {
         if let editor = activeTextEditor() { editor.selectAll(nil); return }
-        let itemRows = browserRows.indices.filter { browserRows[$0].item != nil }
-        browserTable.selectRowIndexes(IndexSet(itemRows), byExtendingSelection: false)
+
+        let itemIdentifiers = selectableBrowserItemIdentifiers
+        guard !itemIdentifiers.isEmpty else { return }
+        if itemIdentifiers.isSubset(of: checkedItemIdentifiers) {
+            checkedItemIdentifiers.subtract(itemIdentifiers)
+            browserTable.deselectAll(nil)
+        } else {
+            checkedItemIdentifiers.formUnion(itemIdentifiers)
+            selectCheckedItemsInTable()
+        }
+        reloadBrowserSelectionCheckboxes()
+        updatePreview()
+        updateSelectAllMenuItem()
     }
 
     func showProperties() {
@@ -690,7 +926,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             menuItem("复制", #selector(copySelectionAction), key: "c"),
             menuItem("粘贴", #selector(pasteSelectionAction), key: "v"),
             .separator(),
-            menuItem("全选", #selector(selectAllAction), key: "a")
+            makeSelectAllMenuItem()
         ]))
         main.addItem(menu(title: "文件", items: [
             menuItem("新建文件夹", #selector(folderAction), key: "n", modifiers: [.command, .shift]),
@@ -707,16 +943,29 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             menuItem("上级目录", #selector(upAction), key: "\u{F700}"),
             menuItem("刷新", #selector(reloadAction), key: "r"),
             .separator(),
+            menuItem("显示或隐藏左侧栏", #selector(toggleConnectionSidebarAction)),
+            makePreviewMenuItem(),
+            menuItem("显示或隐藏传输栏", #selector(toggleTransferPaneAction)),
             menuItem("显示或隐藏工具栏", #selector(toggleToolbarAction), key: "t", modifiers: [.command, .option])
         ]))
         main.addItem(menu(title: "同步", items: [
-            menuItem("配置自动同步", #selector(configureSyncAction)),
             menuItem("立即同步", #selector(syncAction))
+        ]))
+        main.addItem(menu(title: "传输", items: [
+            menuItem("开始全部任务", #selector(startAllTransfersAction)),
+            menuItem("停止全部任务", #selector(pauseAllTransfersAction)),
+            menuItem("重试失败任务", #selector(retryFailedTransfersAction)),
+            .separator(),
+            menuItem("清除已完成和失败任务", #selector(clearFinishedTransfersAction))
+        ]))
+        main.addItem(menu(title: "设置", items: [
+            menuItem("打开设置…", #selector(settingsAction), key: ",")
         ]))
         main.addItem(menu(title: "帮助", items: [
             menuItem("中文使用说明", #selector(showChineseReadme))
         ]))
         NSApp.mainMenu = main
+        AppLocalization.shared.localize(menu: main)
     }
 
     private func applicationMenu() -> NSMenuItem {
@@ -749,6 +998,28 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         item.keyEquivalentModifierMask = modifiers
         item.target = self
         return item
+    }
+
+    private func makePreviewMenuItem() -> NSMenuItem {
+        let item = menuItem("显示预览栏", #selector(togglePreviewSidebarAction), key: "p", modifiers: [.command, .option])
+        previewMenuItem = item
+        updatePreviewMenuItem()
+        return item
+    }
+
+    private func makeSelectAllMenuItem() -> NSMenuItem {
+        let item = menuItem("全选", #selector(selectAllAction), key: "a")
+        selectAllMenuItem = item
+        updateSelectAllMenuItem()
+        return item
+    }
+
+    private func updateSelectAllMenuItem() {
+        guard let item = selectAllMenuItem else { return }
+        item.title = AppLocalization.shared.text(areAllVisibleItemsChecked ? "取消全选" : "全选")
+        item.state = areAllVisibleItemsChecked ? .on : .off
+        // Keep Command-A available to focused text fields even when the remote list is empty.
+        item.isEnabled = true
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(toolbar) }
@@ -786,6 +1057,8 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
             item.action = #selector(toggleAutomaticSyncAction)
         default: return nil
         }
+        item.label = AppLocalization.shared.text(item.label)
+        item.toolTip = item.toolTip.map(AppLocalization.shared.text)
         return item
     }
 
@@ -793,6 +1066,7 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc fileprivate func editAction() { editConnection() }
     @objc fileprivate func connectAction() { connectSelected() }
     @objc fileprivate func disconnectAction() { disconnectSelected() }
+    @objc fileprivate func toggleConnectionAction() { toggleSelectedConnection() }
     @objc fileprivate func upAction() { goUp() }
     @objc fileprivate func reloadAction() { reloadFolder() }
     @objc fileprivate func folderAction() { newFolder() }
@@ -808,19 +1082,55 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc fileprivate func deleteAction() { deleteItems() }
     @objc fileprivate func propertiesAction() { showProperties() }
     @objc fileprivate func syncAction() { runSync() }
+    @objc fileprivate func startAllTransfersAction() { store.startAllTransfers() }
+    @objc fileprivate func pauseAllTransfersAction() { store.pauseAllTransfers() }
+    @objc fileprivate func retryFailedTransfersAction() { store.retryFailedTransfers() }
+    @objc fileprivate func clearFinishedTransfersAction() { store.clearFinishedTransfers() }
+    @objc fileprivate func transferAction(_ sender: NSButton) {
+        guard let id = (sender as? TransferActionButton)?.transferID,
+              let transfer = store.transfers.first(where: { $0.id == id }) else { return }
+        switch transfer.status {
+        case .queued, .running: store.pauseTransfer(id)
+        case .paused: store.resumeTransfer(id)
+        case .failed: store.retryTransfer(id)
+        case .succeeded: break
+        }
+    }
     @objc fileprivate func toggleAutomaticSyncAction() {
         store.toggleAutomaticSync()
         updateAutomaticSyncToolbarItem()
     }
     @objc fileprivate func configureSyncAction() { configureSync() }
+    @objc fileprivate func settingsAction() { showSettings() }
+    @objc fileprivate func togglePreviewSidebarAction() {
+        let visible = !PreviewPreferences.shared.isSidebarVisible
+        PreviewPreferences.shared.setSidebarVisible(visible)
+        fileManagerViewController?.setPreviewSidebarVisible(visible)
+        if visible { updatePreview() }
+        updatePreviewMenuItem()
+    }
+    @objc fileprivate func toggleConnectionSidebarAction() {
+        let visible = !PreviewPreferences.shared.isConnectionSidebarVisible
+        PreviewPreferences.shared.setConnectionSidebarVisible(visible)
+        fileManagerViewController?.setConnectionSidebarVisible(visible)
+    }
+    @objc fileprivate func toggleTransferPaneAction() {
+        let visible = !PreviewPreferences.shared.isTransferPaneVisible
+        PreviewPreferences.shared.setTransferPaneVisible(visible)
+        fileManagerViewController?.setTransferPaneVisible(visible)
+    }
     @objc fileprivate func toggleToolbarAction() { window?.toggleToolbarShown(self) }
 
     private func updateAutomaticSyncToolbarItem() {
         guard let item = automaticSyncToolbarItem else { return }
         let enabled = store.automaticSyncEnabled
-        item.label = enabled ? "自动同步：开" : "自动同步：关"
-        item.toolTip = enabled ? "关闭所有定时和本地变更自动同步" : "开启定时和本地变更自动同步"
+        item.label = AppLocalization.shared.text(enabled ? "自动同步：开" : "自动同步：关")
+        item.toolTip = AppLocalization.shared.text(enabled ? "关闭所有定时和本地变更自动同步" : "开启定时和本地变更自动同步")
         item.image = symbol(enabled ? "arrow.triangle.2.circlepath.circle.fill" : "pause.circle")
+    }
+
+    private func updatePreviewMenuItem() {
+        previewMenuItem?.state = PreviewPreferences.shared.isSidebarVisible ? .on : .off
     }
 
     @objc private func showAbout() {
@@ -833,36 +1143,37 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
     @objc private func showChineseReadme() {
         let alert = NSAlert()
         alert.messageText = "CloudShelf 使用说明"
-        alert.informativeText = "1. 选择“连接 > 新建连接”添加服务器。\n2. 在左侧选择服务器并浏览文件。\n3. 使用“文件”菜单上传、下载、移动、复制或删除。\n4. 使用“同步”菜单设置本地文件夹的自动同步。\n\n完整中文说明位于项目目录的 README.zh-CN.md。"
+        alert.informativeText = "1. 选择“连接 > 新建连接”添加服务器。\n2. 在左侧选择服务器并浏览文件。\n3. 使用“文件”菜单上传、下载、移动、复制或删除。\n4. 在“设置”中管理本地文件夹同步和文件预览。\n\n完整中文说明位于项目目录的 README.zh-CN.md。"
         alert.runModal()
     }
 
     private func presentForm(title: String, form: NSView, actionTitle: String, completion: @escaping () -> Void) {
+        AppLocalization.shared.localize(view: form)
         let alert = NSAlert()
-        alert.messageText = title
+        alert.messageText = AppLocalization.shared.text(title)
         alert.accessoryView = form
-        alert.addButton(withTitle: actionTitle)
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: AppLocalization.shared.text(actionTitle))
+        alert.addButton(withTitle: AppLocalization.shared.text("取消"))
         alert.beginSheetModal(for: window!) { response in if response == .alertFirstButtonReturn { completion() } }
     }
 
     private func prompt(title: String, message: String, placeholder: String, value: String = "", completion: @escaping (String) -> Void) {
         let input = NSTextField(string: value)
-        input.placeholderString = placeholder
+        input.placeholderString = AppLocalization.shared.text(placeholder)
         input.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
         let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
+        alert.messageText = AppLocalization.shared.text(title)
+        alert.informativeText = AppLocalization.shared.text(message)
         alert.accessoryView = input
-        alert.addButton(withTitle: "继续")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: AppLocalization.shared.isEnglish ? "Continue" : "继续")
+        alert.addButton(withTitle: AppLocalization.shared.text("取消"))
         alert.beginSheetModal(for: window!) { response in
             let value = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if response == .alertFirstButtonReturn, !value.isEmpty { completion(value) }
         }
     }
 
-    private func cell(identifier: NSUserInterfaceItemIdentifier, text: String, image: NSImage?) -> NSTableCellView {
+    private func cell(identifier: NSUserInterfaceItemIdentifier, text: String, image: NSImage?, localize: Bool) -> NSTableCellView {
         let reusable = browserTable.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
         let view = reusable ?? NSTableCellView()
         if view.identifier == nil {
@@ -892,9 +1203,78 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
                 textField.centerYAnchor.constraint(equalTo: view.centerYAnchor)
             ])
         }
-        view.textField?.stringValue = text
+        view.textField?.stringValue = localize ? AppLocalization.shared.text(text) : text
         view.imageView?.image = image
         return view
+    }
+
+    private func browserSelectionCell(row: Int) -> NSTableCellView {
+        let identifier = NSUserInterfaceItemIdentifier("browser-selection")
+        let reusable = browserTable.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        let button: BrowserCheckboxButton
+        if view.identifier == nil {
+            view.identifier = identifier
+            button = BrowserCheckboxButton(checkboxWithTitle: "", target: self, action: #selector(toggleBrowserItemSelection(_:)))
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.toolTip = "选择此项目"
+            view.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                button.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            ])
+        } else {
+            button = view.subviews.compactMap { $0 as? BrowserCheckboxButton }.first!
+        }
+
+        guard row >= 0, row < browserRows.count, let item = browserRows[row].item else {
+            button.itemIdentifier = nil
+            button.state = .off
+            button.isEnabled = false
+            button.toolTip = nil
+            return view
+        }
+        button.itemIdentifier = item.path
+        button.state = checkedItemIdentifiers.contains(item.path) ? .on : .off
+        button.isEnabled = true
+        button.toolTip = "选择 \(item.name)"
+        return view
+    }
+
+    @objc private func toggleBrowserItemSelection(_ sender: NSButton) {
+        guard let button = sender as? BrowserCheckboxButton, let identifier = button.itemIdentifier else { return }
+        if button.state == .on {
+            checkedItemIdentifiers.insert(identifier)
+        } else {
+            checkedItemIdentifiers.remove(identifier)
+        }
+        selectCheckedItemsInTable()
+        reloadBrowserSelectionCheckboxes()
+        updatePreview()
+        updateSelectAllMenuItem()
+    }
+
+    private func selectCheckedItemsInTable() {
+        let rows = browserRows.indices.filter { index in
+            guard let item = browserRows[index].item else { return false }
+            return checkedItemIdentifiers.contains(item.path)
+        }
+        browserTable.selectRowIndexes(IndexSet(rows), byExtendingSelection: false)
+    }
+
+    private func reloadBrowserSelectionCheckboxes() {
+        guard !browserRows.isEmpty else { return }
+        let selectionColumn = browserTable.column(withIdentifier: NSUserInterfaceItemIdentifier("selection"))
+        guard selectionColumn >= 0 else { return }
+        browserTable.reloadData(
+            forRowIndexes: IndexSet(integersIn: 0..<browserRows.count),
+            columnIndexes: IndexSet(integer: selectionColumn)
+        )
+    }
+
+    private static func isDirectory(atPath path: String) -> Bool {
+        var isDirectory = ObjCBool(false)
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     private func transferProgressCell(_ transfer: TransferTask) -> NSTableCellView {
@@ -928,12 +1308,13 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         let progress = view.subviews.compactMap { $0 as? NSProgressIndicator }.first
         let label = view.subviews.compactMap { $0 as? NSTextField }.first
         if let total = transfer.totalBytes, total > 0 {
+            let completed = min(max(transfer.completedBytes, 0), total)
             progress?.stopAnimation(nil)
             progress?.isIndeterminate = false
             progress?.minValue = 0
             progress?.maxValue = Double(total)
-            progress?.doubleValue = Double(min(transfer.completedBytes, total))
-            label?.stringValue = "\(Int((Double(transfer.completedBytes) / Double(total)) * 100))%"
+            progress?.doubleValue = Double(completed)
+            label?.stringValue = "\(Int((Double(completed) / Double(total)) * 100))%"
         } else if transfer.status == .running {
             progress?.isIndeterminate = true
             progress?.startAnimation(nil)
@@ -949,9 +1330,87 @@ final class FileManagerWindowController: NSWindowController, NSTableViewDataSour
         return view
     }
 
+    private func transferActionCell(_ transfer: TransferTask) -> NSTableCellView {
+        let identifier = NSUserInterfaceItemIdentifier("transfer-actions")
+        let reusable = transferTable.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        let button: TransferActionButton
+        if view.identifier == nil {
+            view.identifier = identifier
+            button = TransferActionButton(title: "", target: self, action: #selector(transferAction(_:)))
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                button.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            ])
+        } else {
+            button = view.subviews.compactMap { $0 as? TransferActionButton }.first!
+        }
+        button.transferID = transfer.id
+        switch transfer.status {
+        case .queued, .running:
+            button.title = "暂停"
+            button.isEnabled = true
+        case .paused:
+            button.title = "继续"
+            button.isEnabled = true
+        case .failed:
+            button.title = "重试"
+            button.isEnabled = true
+        case .succeeded:
+            button.title = "完成"
+            button.isEnabled = false
+        }
+        return view
+    }
+
     private func transferSpeedDescription(_ transfer: TransferTask) -> String {
         guard let speed = transfer.bytesPerSecond, speed > 0 else { return "-" }
-        return "\(ByteCountFormatter.string(fromByteCount: Int64(speed), countStyle: .file))/秒"
+        let unit = AppLocalization.shared.isEnglish ? "/s" : "/秒"
+        return "\(ByteCountFormatter.string(fromByteCount: Int64(speed), countStyle: .file))\(unit)"
+    }
+
+    private func connectionStateCell(for profile: ConnectionProfile) -> NSTableCellView {
+        let identifier = NSUserInterfaceItemIdentifier("connection-state")
+        let reusable = connectionTable.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        let imageView: NSImageView
+        if view.identifier == nil {
+            view.identifier = identifier
+            imageView = NSImageView()
+            imageView.translatesAutoresizingMaskIntoConstraints = false
+            imageView.imageScaling = .scaleProportionallyDown
+            view.addSubview(imageView)
+            NSLayoutConstraint.activate([
+                imageView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                imageView.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+                imageView.widthAnchor.constraint(equalToConstant: 12),
+                imageView.heightAnchor.constraint(equalToConstant: 12)
+            ])
+        } else {
+            imageView = view.subviews.compactMap { $0 as? NSImageView }.first!
+        }
+
+        let state = connectionDisplayState(for: profile)
+        switch state {
+        case .connected:
+            imageView.image = symbol("circle.fill")
+            imageView.contentTintColor = .systemGreen
+        case .connecting:
+            imageView.image = symbol("arrow.triangle.2.circlepath.circle.fill")
+            imageView.contentTintColor = .systemBlue
+        case .disconnected:
+            imageView.image = symbol("circle")
+            imageView.contentTintColor = .tertiaryLabelColor
+        case .failed:
+            imageView.image = symbol("exclamationmark.circle.fill")
+            imageView.contentTintColor = .systemRed
+        }
+        view.toolTip = "\(profile.name)：\(connectionStateDescription(state))"
+        return view
     }
 
     private func symbol(_ name: String) -> NSImage? {
@@ -985,12 +1444,14 @@ private final class RemoteItemPropertiesWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        panel.title = "属性 - \(item.name)"
+        panel.title = "\(AppLocalization.shared.text("属性")) - \(item.name)"
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         super.init(window: panel)
         panel.center()
-        panel.contentView = makeContentView(panel: panel)
+        let contentView = makeContentView(panel: panel)
+        panel.contentView = contentView
+        AppLocalization.shared.localize(view: contentView)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1150,6 +1611,15 @@ private final class RemoteItemPropertiesWindowController: NSWindowController {
 @MainActor
 private final class FileManagerViewController: NSViewController {
     private unowned let owner: FileManagerWindowController
+    private let outerSplit = NSSplitView()
+    private let contentSplit = NSSplitView()
+    private let previewSidebar = RemotePreviewSidebar()
+    private var connectionSidebar: NSView?
+    private var contentStack: NSStackView?
+    private var transferPane: NSView?
+    private var isPreviewSidebarVisible = false
+    private var isConnectionSidebarVisible = false
+    private var isTransferPaneVisible = false
 
     init(owner: FileManagerWindowController) {
         self.owner = owner
@@ -1160,22 +1630,92 @@ private final class FileManagerViewController: NSViewController {
 
     override func loadView() {
         let root = NSView()
-        let split = NSSplitView()
-        split.isVertical = true
-        split.dividerStyle = .thin
-        split.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(split)
+        outerSplit.isVertical = true
+        outerSplit.dividerStyle = .thin
+        outerSplit.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(outerSplit)
         NSLayoutConstraint.activate([
-            split.leadingAnchor.constraint(equalTo: root.leadingAnchor), split.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            split.topAnchor.constraint(equalTo: root.topAnchor), split.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+            outerSplit.leadingAnchor.constraint(equalTo: root.leadingAnchor), outerSplit.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            outerSplit.topAnchor.constraint(equalTo: root.topAnchor), outerSplit.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         ])
 
         let sidebar = makeSidebar()
-        let content = makeContent()
-        split.addArrangedSubview(sidebar)
-        split.addArrangedSubview(content)
-        split.setPosition(255, ofDividerAt: 0)
+        connectionSidebar = sidebar
+        contentSplit.isVertical = true
+        contentSplit.dividerStyle = .thin
+        contentSplit.addArrangedSubview(makeContent())
+        if PreviewPreferences.shared.isSidebarVisible {
+            contentSplit.addArrangedSubview(previewSidebar)
+            isPreviewSidebarVisible = true
+        }
+        if PreviewPreferences.shared.isConnectionSidebarVisible {
+            outerSplit.addArrangedSubview(sidebar)
+            isConnectionSidebarVisible = true
+        }
+        outerSplit.addArrangedSubview(contentSplit)
         self.view = root
+        DispatchQueue.main.async { [weak self] in
+            self?.positionSplitViews()
+        }
+    }
+
+    func showPreview(item: RemoteItem?, client: (any RemoteClient)?) {
+        guard isPreviewSidebarVisible else { return }
+        previewSidebar.show(item: item, client: client)
+    }
+
+    func setPreviewSidebarVisible(_ visible: Bool) {
+        guard visible != isPreviewSidebarVisible else { return }
+        isPreviewSidebarVisible = visible
+        if visible {
+            contentSplit.addArrangedSubview(previewSidebar)
+            DispatchQueue.main.async { [weak self] in
+                self?.positionPreviewSidebar()
+            }
+        } else {
+            previewSidebar.reset()
+            contentSplit.removeArrangedSubview(previewSidebar)
+            previewSidebar.removeFromSuperview()
+        }
+    }
+
+    func setConnectionSidebarVisible(_ visible: Bool) {
+        guard visible != isConnectionSidebarVisible, let connectionSidebar else { return }
+        isConnectionSidebarVisible = visible
+        if visible {
+            outerSplit.insertArrangedSubview(connectionSidebar, at: 0)
+            DispatchQueue.main.async { [weak self] in self?.positionSplitViews() }
+        } else {
+            outerSplit.removeArrangedSubview(connectionSidebar)
+            connectionSidebar.removeFromSuperview()
+        }
+    }
+
+    func setTransferPaneVisible(_ visible: Bool) {
+        guard visible != isTransferPaneVisible, let contentStack, let transferPane else { return }
+        isTransferPaneVisible = visible
+        if visible {
+            contentStack.addArrangedSubview(transferPane)
+        } else {
+            contentStack.removeArrangedSubview(transferPane)
+            transferPane.removeFromSuperview()
+        }
+    }
+
+    private func positionPreviewSidebar() {
+        guard isPreviewSidebarVisible, contentSplit.bounds.width > 0 else { return }
+        let previewWidth = min(330, max(240, contentSplit.bounds.width - 420))
+        contentSplit.setPosition(contentSplit.bounds.width - previewWidth, ofDividerAt: 0)
+    }
+
+    private func positionSplitViews() {
+        guard outerSplit.bounds.width > 0 else { return }
+        if isConnectionSidebarVisible {
+            let sidebarWidth = min(210, max(190, outerSplit.bounds.width * 0.19))
+            outerSplit.setPosition(sidebarWidth, ofDividerAt: 0)
+        }
+        outerSplit.layoutSubtreeIfNeeded()
+        positionPreviewSidebar()
     }
 
     private func makeSidebar() -> NSView {
@@ -1188,8 +1728,19 @@ private final class FileManagerViewController: NSViewController {
         owner.connectionTable.dataSource = owner
         owner.connectionTable.headerView = nil
         owner.connectionTable.rowHeight = 38
-        owner.connectionTable.addTableColumn(column("connection", title: "名称", width: 175))
-        owner.connectionTable.addTableColumn(column("protocol", title: "协议", width: 70))
+        owner.connectionTable.addTableColumn(column("connection", title: "名称", width: 122))
+        owner.connectionTable.addTableColumn(column("state", title: "状态", width: 28))
+        owner.sidebarConnectionStatus.font = NSFont.systemFont(ofSize: 11)
+        owner.sidebarConnectionStatus.textColor = .secondaryLabelColor
+        owner.sidebarConnectionStatus.lineBreakMode = .byTruncatingMiddle
+        owner.sidebarConnectionStatus.maximumNumberOfLines = 1
+        owner.connectionToggleButton.bezelStyle = .rounded
+        owner.connectionToggleButton.controlSize = .small
+        let connectionActions = NSStackView(views: [owner.sidebarConnectionStatus, owner.connectionToggleButton])
+        connectionActions.orientation = .horizontal
+        connectionActions.alignment = .centerY
+        connectionActions.spacing = 8
+        connectionActions.arrangedSubviews.first?.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let button = NSButton(title: "新建连接", target: owner, action: #selector(FileManagerWindowController.addAction))
         button.bezelStyle = .rounded
         let remove = NSButton(title: "移除", target: owner, action: #selector(FileManagerWindowController.removeConnection))
@@ -1197,7 +1748,7 @@ private final class FileManagerViewController: NSViewController {
         let row = NSStackView(views: [button, remove])
         row.orientation = .horizontal
         row.spacing = 8
-        let stack = NSStackView(views: [title, scroll, row])
+        let stack = NSStackView(views: [title, scroll, connectionActions, row])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -1217,9 +1768,13 @@ private final class FileManagerViewController: NSViewController {
         owner.pathLabel.lineBreakMode = .byTruncatingMiddle
         owner.connectionStatus.font = NSFont.systemFont(ofSize: 12)
         owner.connectionStatus.textColor = .secondaryLabelColor
-        let top = NSStackView(views: [owner.pathLabel, NSView(), owner.connectionStatus])
+        let leftSidebar = sidebarToggleButton(symbolName: "sidebar.left", toolTip: "显示或隐藏左侧连接栏", action: #selector(FileManagerWindowController.toggleConnectionSidebarAction))
+        let transferSidebar = sidebarToggleButton(symbolName: "rectangle.bottomthird.inset.filled", toolTip: "显示或隐藏底部传输栏", action: #selector(FileManagerWindowController.toggleTransferPaneAction))
+        let previewSidebar = sidebarToggleButton(symbolName: "sidebar.right", toolTip: "显示或隐藏右侧预览栏", action: #selector(FileManagerWindowController.togglePreviewSidebarAction))
+        let top = NSStackView(views: [owner.pathLabel, NSView(), owner.connectionStatus, leftSidebar, transferSidebar, previewSidebar])
         top.orientation = .horizontal
         top.alignment = .centerY
+        top.spacing = 8
         top.translatesAutoresizingMaskIntoConstraints = false
         let browserScroll = scrollView(for: owner.browserTable)
         owner.browserTable.delegate = owner
@@ -1228,6 +1783,10 @@ private final class FileManagerViewController: NSViewController {
         owner.browserTable.target = owner
         owner.browserTable.doubleAction = #selector(FileManagerWindowController.openSelectedItem)
         owner.browserTable.registerForDraggedTypes([.fileURL])
+        let selectionColumn = column("selection", title: "", width: 34)
+        selectionColumn.minWidth = 34
+        selectionColumn.maxWidth = 34
+        owner.browserTable.addTableColumn(selectionColumn)
         owner.browserTable.addTableColumn(column("name", title: "名称", width: 380))
         owner.browserTable.addTableColumn(column("modified", title: "修改时间", width: 160))
         owner.browserTable.addTableColumn(column("size", title: "大小", width: 95))
@@ -1244,20 +1803,51 @@ private final class FileManagerViewController: NSViewController {
         owner.transferTable.addTableColumn(column("state", title: "状态", width: 315))
         owner.transferTable.addTableColumn(column("progress", title: "进度", width: 165))
         owner.transferTable.addTableColumn(column("speed", title: "速率", width: 115))
-        let stack = NSStackView(views: [top, browserScroll, transferTitle, transferScroll])
+        owner.transferTable.addTableColumn(column("actions", title: "操作", width: 68))
+        let startAll = NSButton(title: "全部开始", target: owner, action: #selector(FileManagerWindowController.startAllTransfersAction))
+        let stopAll = NSButton(title: "全部停止", target: owner, action: #selector(FileManagerWindowController.pauseAllTransfersAction))
+        let retryFailed = NSButton(title: "重试失败", target: owner, action: #selector(FileManagerWindowController.retryFailedTransfersAction))
+        let clearFinished = NSButton(title: "清除已结束", target: owner, action: #selector(FileManagerWindowController.clearFinishedTransfersAction))
+        [startAll, stopAll, retryFailed, clearFinished].forEach { $0.bezelStyle = .rounded; $0.controlSize = .small }
+        let transferHeader = NSStackView(views: [transferTitle, NSView(), startAll, stopAll, retryFailed, clearFinished])
+        transferHeader.orientation = .horizontal
+        transferHeader.alignment = .centerY
+        transferHeader.spacing = 7
+        transferHeader.arrangedSubviews[1].setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let transferStack = NSStackView(views: [transferHeader, transferScroll])
+        transferStack.orientation = .vertical
+        transferStack.alignment = .leading
+        transferStack.spacing = 6
+        transferPane = transferStack
+        let stack = NSStackView(views: [top, browserScroll])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 9
         stack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack = stack
+        if PreviewPreferences.shared.isTransferPaneVisible {
+            stack.addArrangedSubview(transferStack)
+            isTransferPaneVisible = true
+        }
         container.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14), stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
             stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 12), stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
             top.widthAnchor.constraint(equalTo: stack.widthAnchor), browserScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            transferScroll.widthAnchor.constraint(equalTo: stack.widthAnchor), browserScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            transferStack.widthAnchor.constraint(equalTo: stack.widthAnchor), transferScroll.widthAnchor.constraint(equalTo: transferStack.widthAnchor), browserScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 300),
             transferScroll.heightAnchor.constraint(equalToConstant: 130)
         ])
         return container
+    }
+
+    private func sidebarToggleButton(symbolName: String, toolTip: String, action: Selector) -> NSButton {
+        let button = NSButton(image: NSImage(systemSymbolName: symbolName, accessibilityDescription: toolTip) ?? NSImage(), target: owner, action: action)
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.bezelStyle = .texturedRounded
+        button.controlSize = .small
+        button.toolTip = AppLocalization.shared.text(toolTip)
+        return button
     }
 
     private func scrollView(for table: NSTableView) -> NSScrollView {
@@ -1272,7 +1862,14 @@ private final class FileManagerViewController: NSViewController {
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
         column.title = title
         column.width = width
-        column.minWidth = id == "name" ? 180 : 65
+        switch id {
+        case "name": column.minWidth = 180
+        case "connection": column.minWidth = 90
+        case "protocol": column.minWidth = 45
+        case "state": column.minWidth = 24
+        case "selection": column.minWidth = 32
+        default: column.minWidth = 65
+        }
         return column
     }
 }
@@ -1458,6 +2055,228 @@ private final class ConnectionForm: NSView {
         case 1: return .acceptNew
         default: return nil
         }
+    }
+}
+
+@MainActor
+final class SettingsPlaceholderView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let title = NSTextField(labelWithString: "选择一个已连接的服务器")
+        title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        let detail = NSTextField(wrappingLabelWithString: "同步规则属于某一台服务器。关闭设置后，在左侧选择并连接服务器，再打开“设置 > 同步”。")
+        detail.textColor = .secondaryLabelColor
+        let stack = NSStackView(views: [title, detail])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 18)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+@MainActor
+private final class SyncRulesSettingsView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private let profile: ConnectionProfile
+    private let client: any RemoteClient
+    private let saveRules: ([SyncRule]) -> Void
+    private let runRule: (UUID) -> Void
+    private let table = NSTableView()
+    private var rules: [SyncRule]
+    private var ruleEditor: SyncRuleEditorWindowController?
+
+    init(
+        profile: ConnectionProfile,
+        session: RemoteSession,
+        saveRules: @escaping ([SyncRule]) -> Void,
+        runRule: @escaping (UUID) -> Void
+    ) {
+        self.profile = profile
+        self.client = session.client
+        self.rules = profile.syncRules
+        self.saveRules = saveRules
+        self.runRule = runRule
+        super.init(frame: .zero)
+        configureView()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { rules.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0, row < rules.count else { return nil }
+        let rule = rules[row]
+        let identifier = tableColumn?.identifier.rawValue ?? ""
+        let text: String
+        switch identifier {
+        case "local": text = rule.localFolder
+        case "remote": text = rule.remoteFolder
+        case "direction": text = syncActionsText(rule)
+        case "schedule":
+            if AppLocalization.shared.isEnglish {
+                text = rule.syncOnLocalChanges == true
+                    ? "On local changes + every \(rule.intervalMinutes) minutes"
+                    : "Every \(rule.intervalMinutes) minutes"
+            } else {
+                text = rule.syncOnLocalChanges == true ? "变更后自动 + 每 \(rule.intervalMinutes) 分钟" : "每 \(rule.intervalMinutes) 分钟"
+            }
+        case "state": text = rule.isEnabled ? "已启用" : "已停用"
+        default: text = ""
+        }
+        return textCell(identifier: NSUserInterfaceItemIdentifier("settings-sync-\(identifier)"), text: text)
+    }
+
+    @objc private func addRule() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = AppLocalization.shared.text("选择本地文件夹")
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let localFolder = panel.url?.path, let self else { return }
+            self.openRuleEditor(localFolder: localFolder, existing: nil, index: nil)
+        }
+    }
+
+    @objc private func editRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count else { return }
+        openRuleEditor(localFolder: rules[row].localFolder, existing: rules[row], index: row)
+    }
+
+    @objc private func removeRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count else { return }
+        rules.remove(at: row)
+        persistRules()
+        table.reloadData()
+    }
+
+    @objc private func toggleRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count else { return }
+        rules[row].isEnabled.toggle()
+        persistRules()
+        table.reloadData()
+    }
+
+    @objc private func runSelectedRule() {
+        let row = table.selectedRow
+        guard row >= 0, row < rules.count, rules[row].isEnabled else { return }
+        runRule(rules[row].id)
+    }
+
+    private func configureView() {
+        table.delegate = self
+        table.dataSource = self
+        table.rowHeight = 30
+        table.addTableColumn(column("local", title: "本地文件夹", width: 155))
+        table.addTableColumn(column("remote", title: "远端", width: 100))
+        table.addTableColumn(column("direction", title: "同步操作", width: 165))
+        table.addTableColumn(column("schedule", title: "执行方式", width: 145))
+        table.addTableColumn(column("state", title: "状态", width: 65))
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = table
+
+        let connectionText = AppLocalization.shared.isEnglish
+            ? "Server: \(profile.name)"
+            : "服务器：\(profile.name)"
+        let connection = NSTextField(labelWithString: connectionText)
+        connection.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let add = NSButton(title: "添加规则", target: self, action: #selector(addRule))
+        let edit = NSButton(title: "编辑", target: self, action: #selector(editRule))
+        let remove = NSButton(title: "移除", target: self, action: #selector(removeRule))
+        let toggle = NSButton(title: "启用/停用", target: self, action: #selector(toggleRule))
+        let run = NSButton(title: "立即执行", target: self, action: #selector(runSelectedRule))
+        [add, edit, remove, toggle, run].forEach { $0.bezelStyle = .rounded }
+        let controls = NSStackView(views: [add, edit, remove, toggle, run, NSView()])
+        controls.orientation = .horizontal
+        controls.spacing = 8
+        controls.arrangedSubviews.last?.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let stack = NSStackView(views: [connection, scroll, controls])
+        stack.orientation = .vertical
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            controls.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+    }
+
+    private func openRuleEditor(localFolder: String, existing: SyncRule?, index: Int?) {
+        ruleEditor?.close()
+        let editor = SyncRuleEditorWindowController(
+            localFolder: localFolder,
+            existing: existing,
+            client: client,
+            saveRule: { [weak self] rule in
+                guard let self else { return }
+                if let index { self.rules[index] = rule } else { self.rules.append(rule) }
+                self.persistRules()
+                self.table.reloadData()
+            }
+        )
+        ruleEditor = editor
+        editor.showWindow(nil)
+        editor.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func persistRules() { saveRules(rules) }
+
+    private func column(_ id: String, title: String, width: CGFloat) -> NSTableColumn {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+        column.title = title
+        column.width = width
+        column.minWidth = 60
+        return column
+    }
+
+    private func textCell(identifier: NSUserInterfaceItemIdentifier, text: String) -> NSTableCellView {
+        let reusable = table.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+        let view = reusable ?? NSTableCellView()
+        if view.identifier == nil {
+            view.identifier = identifier
+            let label = NSTextField(labelWithString: "")
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.lineBreakMode = .byTruncatingMiddle
+            view.textField = label
+            view.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+                label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+                label.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            ])
+        }
+        view.textField?.stringValue = text
+        return view
+    }
+
+    private func syncActionsText(_ rule: SyncRule) -> String {
+        var actions: [String] = []
+        if rule.uploadsLocalChanges { actions.append("本地上传") }
+        if rule.downloadsRemoteChanges { actions.append("远端下载") }
+        if rule.propagatesLocalDeletes { actions.append("本地删除 -> 远端") }
+        if rule.propagatesRemoteDeletes { actions.append("远端删除 -> 本地") }
+        let localizedActions = actions.map(AppLocalization.shared.text)
+        return localizedActions.isEmpty
+            ? AppLocalization.shared.text("未选择")
+            : localizedActions.joined(separator: AppLocalization.shared.isEnglish ? ", " : "、")
     }
 }
 
@@ -1689,12 +2508,14 @@ private final class SyncRuleEditorWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = existing == nil ? "添加同步规则" : "编辑同步规则"
+        window.title = AppLocalization.shared.text(existing == nil ? "添加同步规则" : "编辑同步规则")
         super.init(window: window)
         window.center()
         interval.addItems(withTitles: ["5 分钟", "15 分钟", "30 分钟", "1 小时"])
         applyExistingRule()
-        window.contentView = makeContentView(window: window)
+        let contentView = makeContentView(window: window)
+        window.contentView = contentView
+        AppLocalization.shared.localize(view: contentView)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1714,7 +2535,7 @@ private final class SyncRuleEditorWindowController: NSWindowController {
         let remoteFolder = remote.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !local.isEmpty, !remoteFolder.isEmpty else {
             let alert = NSAlert()
-            alert.messageText = "请填写本地和远端文件夹。"
+            alert.messageText = AppLocalization.shared.text("请填写本地和远端文件夹。")
             alert.beginSheetModal(for: window!) { _ in }
             return
         }
@@ -1724,7 +2545,7 @@ private final class SyncRuleEditorWindowController: NSWindowController {
         let deletesLocal = deleteLocalWhenRemoteDeleted.state == .on
         guard uploadsLocal || downloadsRemote || deletesRemote || deletesLocal else {
             let alert = NSAlert()
-            alert.messageText = "请至少选择一项同步操作。"
+            alert.messageText = AppLocalization.shared.text("请至少选择一项同步操作。")
             alert.beginSheetModal(for: window!) { _ in }
             return
         }
@@ -1848,10 +2669,12 @@ private final class RemoteFolderPickerWindowController: NSWindowController, NSTa
             backing: .buffered,
             defer: false
         )
-        window.title = "选择远端文件夹"
+        window.title = AppLocalization.shared.text("选择远端文件夹")
         super.init(window: window)
         window.center()
-        window.contentView = makeContentView(window: window)
+        let contentView = makeContentView(window: window)
+        window.contentView = contentView
+        AppLocalization.shared.localize(view: contentView)
         reload()
     }
 
@@ -1897,15 +2720,17 @@ private final class RemoteFolderPickerWindowController: NSWindowController, NSTa
 
     @objc private func reload() {
         pathLabel.stringValue = location
-        statusLabel.stringValue = "正在加载…"
+        statusLabel.stringValue = AppLocalization.shared.text("正在加载…")
         Task { [weak self] in
             guard let self else { return }
             do {
                 self.items = try await self.client.list(at: self.location).filter(\.isDirectory)
-                self.statusLabel.stringValue = "\(self.items.count) 个文件夹"
+                self.statusLabel.stringValue = AppLocalization.shared.isEnglish
+                    ? "\(self.items.count) folders"
+                    : "\(self.items.count) 个文件夹"
             } catch {
                 self.items = []
-                self.statusLabel.stringValue = "加载失败：\(error.localizedDescription)"
+                self.statusLabel.stringValue = "\(AppLocalization.shared.text("加载失败"))：\(error.localizedDescription)"
             }
             self.table.reloadData()
         }

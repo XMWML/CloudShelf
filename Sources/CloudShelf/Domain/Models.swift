@@ -208,6 +208,7 @@ public enum TransferDirection: String, Sendable, Equatable {
 public enum TransferStatus: String, Sendable, Equatable {
     case queued
     case running
+    case paused
     case succeeded
     case failed
 }

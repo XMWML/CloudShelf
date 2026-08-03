@@ -13,9 +13,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-	<string>1.0.5</string>
+	<string>1.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>11</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>CloudShelf 需要访问本地网络中的 FTP、SFTP 和 WebDAV 服务器。</string>
     <key>NSBonjourServices</key>

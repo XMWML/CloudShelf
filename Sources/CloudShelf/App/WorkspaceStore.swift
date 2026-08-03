@@ -249,6 +249,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var sessions: [UUID: RemoteSession] = [:]
     @Published private(set) var transfers: [TransferTask] = []
     @Published private(set) var automaticSyncEnabled: Bool
+    @Published private(set) var maximumConcurrentTransfers: Int
     @Published var lastError: String?
 
     private let profileStore = ProfileStore()
@@ -258,10 +259,24 @@ final class WorkspaceStore: ObservableObject {
     private var localFingerprints: [UUID: LocalFolderFingerprint] = [:]
     private var fingerprintingRuleIDs = Set<UUID>()
     private var pendingChangeSyncs: [UUID: Date] = [:]
+    private typealias TransferWork = @MainActor () async -> Void
+    private var transferJobs: [UUID: TransferWork] = [:]
+    private var transferTargetKeys: [UUID: String] = [:]
+    private var activeTransferTargetKeys = Set<String>()
+    private var queuedTransferIDs: [UUID] = []
+    private var runningTransferTasks: [UUID: Task<Void, Never>] = [:]
+    private var pausedTransferIDs = Set<UUID>()
+    private var resumeAfterCancellationIDs = Set<UUID>()
+    private var resumableTransferIDs = Set<UUID>()
+    private var isTransferQueuePaused = false
     private static let automaticSyncEnabledKey = "CloudShelf.automaticSyncEnabled"
+    private static let maximumConcurrentTransfersKey = "CloudShelf.maximumConcurrentTransfers"
 
     init() {
         automaticSyncEnabled = UserDefaults.standard.object(forKey: Self.automaticSyncEnabledKey) as? Bool ?? true
+        maximumConcurrentTransfers = Self.validConcurrentTransferCount(
+            UserDefaults.standard.object(forKey: Self.maximumConcurrentTransfersKey) as? Int ?? 3
+        )
         Task {
             profiles = await profileStore.load().sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         }
@@ -280,6 +295,101 @@ final class WorkspaceStore: ObservableObject {
         automaticSyncEnabled.toggle()
         UserDefaults.standard.set(automaticSyncEnabled, forKey: Self.automaticSyncEnabledKey)
         if !automaticSyncEnabled { pendingChangeSyncs.removeAll() }
+    }
+
+    func setMaximumConcurrentTransfers(_ count: Int) {
+        maximumConcurrentTransfers = Self.validConcurrentTransferCount(count)
+        UserDefaults.standard.set(maximumConcurrentTransfers, forKey: Self.maximumConcurrentTransfersKey)
+        startQueuedTransfers()
+    }
+
+    func pauseTransfer(_ id: UUID) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
+        switch transfers[index].status {
+        case .queued:
+            resumeAfterCancellationIDs.remove(id)
+            queuedTransferIDs.removeAll { $0 == id }
+            pausedTransferIDs.insert(id)
+            updateTransfer(id, status: .paused, detail: "已暂停，等待继续")
+        case .running:
+            resumeAfterCancellationIDs.remove(id)
+            pausedTransferIDs.insert(id)
+            resumableTransferIDs.insert(id)
+            updateTransfer(id, status: .paused, detail: "正在暂停…")
+            runningTransferTasks[id]?.cancel()
+        case .paused:
+            resumeAfterCancellationIDs.remove(id)
+            pausedTransferIDs.insert(id)
+            runningTransferTasks[id]?.cancel()
+        case .succeeded, .failed:
+            return
+        }
+    }
+
+    func resumeTransfer(_ id: UUID) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }),
+              transfers[index].status == .paused,
+              transferJobs[id] != nil else { return }
+
+        // A process can take a moment to acknowledge cancellation. Preserve an
+        // immediate Continue click and enqueue it only after that process exits.
+        if runningTransferTasks[id] != nil {
+            guard resumeAfterCancellationIDs.insert(id).inserted else { return }
+            pausedTransferIDs.remove(id)
+            updateTransfer(id, status: .paused, detail: "正在停止，随后继续")
+            return
+        }
+
+        pausedTransferIDs.remove(id)
+        updateTransfer(id, status: .queued, detail: "等待继续")
+        enqueueTransferID(id)
+        startQueuedTransfers()
+    }
+
+    func retryTransfer(_ id: UUID) {
+        guard let index = transfers.firstIndex(where: { $0.id == id }),
+              transfers[index].status == .failed,
+              transferJobs[id] != nil else { return }
+        pausedTransferIDs.remove(id)
+        resumeAfterCancellationIDs.remove(id)
+        transfers[index].startedAt = nil
+        transfers[index].finishedAt = nil
+        transfers[index].bytesPerSecond = nil
+        updateTransfer(id, status: .queued, detail: "等待重试", finishedAt: nil)
+        enqueueTransferID(id)
+        startQueuedTransfers()
+    }
+
+    func startAllTransfers() {
+        isTransferQueuePaused = false
+        for transfer in transfers where transfer.status == .paused {
+            resumeTransfer(transfer.id)
+        }
+        startQueuedTransfers()
+    }
+
+    func pauseAllTransfers() {
+        isTransferQueuePaused = true
+        let activeIDs = transfers.filter { $0.status == .queued || $0.status == .running }.map(\.id)
+        activeIDs.forEach(pauseTransfer)
+    }
+
+    func retryFailedTransfers() {
+        transfers.filter { $0.status == .failed }.forEach { retryTransfer($0.id) }
+    }
+
+    func clearFinishedTransfers() {
+        let removable = Set(transfers.filter { $0.status == .succeeded || $0.status == .failed }.map(\.id))
+        transfers.removeAll { removable.contains($0.id) }
+        removable.forEach {
+            transferJobs.removeValue(forKey: $0)
+            if let targetKey = transferTargetKeys.removeValue(forKey: $0) {
+                activeTransferTargetKeys.remove(targetKey)
+            }
+            resumableTransferIDs.remove($0)
+            pausedTransferIDs.remove($0)
+            resumeAfterCancellationIDs.remove($0)
+        }
     }
 
     func save(profile: ConnectionProfile, secret: String?) async {
@@ -392,69 +502,151 @@ final class WorkspaceStore: ObservableObject {
         }
         guard syncingRuleIDs.insert(rule.id).inserted else { return }
         let transfer = TransferTask(direction: .sync, title: "同步 \(URL(fileURLWithPath: rule.localFolder).lastPathComponent)", connectionName: profile.name)
-        transfers.append(transfer)
-        Task {
-            defer { syncingRuleIDs.remove(rule.id) }
-            updateTransfer(transfer.id, status: .running, detail: "正在比较文件夹", startedAt: .now)
-            do {
-                let report = try await syncEngine.synchronize(rule: rule, client: session.client)
-                let deletions = report.deletedRemote + report.deletedLocal
-                let deletionText = deletions == 0 ? "" : "，已删除远端 \(report.deletedRemote) 项、本地 \(report.deletedLocal) 项"
-                updateTransfer(transfer.id, status: .succeeded, detail: "已上传 \(report.uploaded) 项，已下载 \(report.downloaded) 项\(deletionText)", finishedAt: .now)
-                markSynced(ruleID: rule.id, profileID: profile.id)
-                clearChangeTracking(for: rule.id)
-            } catch {
-                updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
-                lastError = error.localizedDescription
-            }
-            await session.reload()
+        enqueueTransfer(transfer, targetKey: "sync:\(profile.id.uuidString):\(rule.id.uuidString)") { [weak self] in
+            await self?.performSync(transferID: transfer.id, profile: profile, rule: rule, session: session)
         }
+    }
+
+    private func performSync(transferID: UUID, profile: ConnectionProfile, rule: SyncRule, session: RemoteSession) async {
+        defer { syncingRuleIDs.remove(rule.id) }
+        updateTransfer(transferID, status: .running, detail: "正在比较文件夹", startedAt: .now)
+        do {
+            try Task.checkCancellation()
+            let report = try await syncEngine.synchronize(rule: rule, client: session.client)
+            try Task.checkCancellation()
+            let deletions = report.deletedRemote + report.deletedLocal
+            let deletionText = deletions == 0 ? "" : "，已删除远端 \(report.deletedRemote) 项、本地 \(report.deletedLocal) 项"
+            updateTransfer(transferID, status: .succeeded, detail: "已上传 \(report.uploaded) 项，已下载 \(report.downloaded) 项\(deletionText)", finishedAt: .now)
+            markSynced(ruleID: rule.id, profileID: profile.id)
+            clearChangeTracking(for: rule.id)
+        } catch {
+            guard !markTransferPausedIfCancelled(transferID) else { return }
+            updateTransfer(transferID, status: .failed, detail: error.localizedDescription, finishedAt: .now)
+            lastError = error.localizedDescription
+        }
+        await session.reload()
+    }
+
+    private func enqueueTransfer(_ transfer: TransferTask, targetKey: String? = nil, work: @escaping TransferWork) {
+        transfers.append(transfer)
+        transferJobs[transfer.id] = work
+        if let targetKey { transferTargetKeys[transfer.id] = targetKey }
+        enqueueTransferID(transfer.id)
+        startQueuedTransfers()
+    }
+
+    private func enqueueTransferID(_ id: UUID) {
+        guard !queuedTransferIDs.contains(id) else { return }
+        queuedTransferIDs.append(id)
+    }
+
+    private func startQueuedTransfers() {
+        guard !isTransferQueuePaused else { return }
+        var inspected = 0
+        while runningTransferTasks.count < maximumConcurrentTransfers,
+              !queuedTransferIDs.isEmpty,
+              inspected < queuedTransferIDs.count {
+            let id = queuedTransferIDs.removeFirst()
+            inspected += 1
+            if let targetKey = transferTargetKeys[id], activeTransferTargetKeys.contains(targetKey) {
+                queuedTransferIDs.append(id)
+                continue
+            }
+            guard let index = transfers.firstIndex(where: { $0.id == id }),
+                  transfers[index].status == .queued,
+                  let work = transferJobs[id] else { continue }
+            if let targetKey = transferTargetKeys[id] { activeTransferTargetKeys.insert(targetKey) }
+            let task = Task { [weak self] in
+                await work()
+                guard let self else { return }
+                self.finishTransferExecution(id)
+            }
+            runningTransferTasks[id] = task
+        }
+    }
+
+    private func finishTransferExecution(_ id: UUID) {
+        runningTransferTasks.removeValue(forKey: id)
+        if let targetKey = transferTargetKeys[id] { activeTransferTargetKeys.remove(targetKey) }
+        if resumeAfterCancellationIDs.remove(id) != nil,
+           let index = transfers.firstIndex(where: { $0.id == id }),
+           transfers[index].status == .paused {
+            pausedTransferIDs.remove(id)
+            updateTransfer(id, status: .queued, detail: "等待继续")
+            enqueueTransferID(id)
+        }
+        startQueuedTransfers()
+    }
+
+    private func markTransferPausedIfCancelled(_ id: UUID) -> Bool {
+        guard Task.isCancelled || pausedTransferIDs.contains(id) else { return false }
+        pausedTransferIDs.insert(id)
+        resumableTransferIDs.insert(id)
+        updateTransfer(id, status: .paused, detail: "已暂停，可继续", finishedAt: nil)
+        return true
+    }
+
+    private static func validConcurrentTransferCount(_ count: Int) -> Int {
+        min(max(count, 1), 8)
     }
 
     private func enqueueUpload(_ url: URL, session: RemoteSession) {
         let destination = session.location
         let transfer = TransferTask(direction: .upload, title: url.lastPathComponent, connectionName: session.profile.name)
-        transfers.append(transfer)
-        Task {
-            do {
-                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
-                if values.isDirectory == true {
-                    updateTransfer(transfer.id, status: .running, detail: "正在准备文件夹", startedAt: .now)
-                    let plan = try await Task.detached(priority: .userInitiated) {
-                        try FolderUploadPlan.make(source: url, remoteParent: destination)
-                    }.value
-                    setTransferTotal(transfer.id, bytes: plan.files.reduce(0) { $0 + $1.size })
-                    try await upload(folder: plan, client: session.client, transferID: transfer.id)
-                    let skipped = plan.skippedItems == 0 ? "" : "，跳过 \(plan.skippedItems) 项"
-                    updateTransfer(
-                        transfer.id,
-                        status: .succeeded,
-                        detail: "已上传 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹\(skipped)",
-                        finishedAt: .now,
-                        completedBytes: plan.files.reduce(0) { $0 + $1.size }
-                    )
-                } else {
-                    let size = Int64(values.fileSize ?? 0)
-                    setTransferTotal(transfer.id, bytes: size)
-                    updateTransfer(transfer.id, status: .running, detail: "正在上传", startedAt: .now)
-                    try await session.client.upload(
-                        url,
-                        to: destination,
-                        progress: transferProgressHandler(for: transfer.id, totalBytes: size)
-                    )
-                    updateTransfer(
-                        transfer.id,
-                        status: .succeeded,
-                        detail: "上传完成",
-                        finishedAt: .now,
-                        completedBytes: size
-                    )
+        enqueueTransfer(
+            transfer,
+            targetKey: "remote:\(session.profile.id.uuidString):\(RemotePath.join(destination, url.lastPathComponent))"
+        ) { [weak self] in
+            await self?.performUpload(transferID: transfer.id, url: url, destination: destination, session: session)
+        }
+    }
+
+    private func performUpload(transferID: UUID, url: URL, destination: String, session: RemoteSession) async {
+        do {
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+            if values.isDirectory == true {
+                updateTransfer(transferID, status: .running, detail: "正在准备文件夹", startedAt: .now)
+                let plan = try await Task.detached(priority: .userInitiated) {
+                    try FolderUploadPlan.make(source: url, remoteParent: destination)
+                }.value
+                try Task.checkCancellation()
+                setTransferTotal(transferID, bytes: plan.files.reduce(0) { $0 + $1.size })
+                try await upload(folder: plan, client: session.client, transferID: transferID)
+                let skipped = plan.skippedItems == 0 ? "" : "，跳过 \(plan.skippedItems) 项"
+                updateTransfer(
+                    transferID,
+                    status: .succeeded,
+                    detail: "已上传 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹\(skipped)",
+                    finishedAt: .now,
+                    completedBytes: plan.files.reduce(0) { $0 + $1.size }
+                )
+            } else {
+                let size = Int64(values.fileSize ?? 0)
+                setTransferTotal(transferID, bytes: size)
+                let supportsResume = await session.client.supportsResumableTransfers()
+                let offset = supportsResume && resumableTransferIDs.contains(transferID)
+                    ? await remoteResumeOffset(for: url.lastPathComponent, in: destination, client: session.client, maximum: size)
+                    : 0
+                if offset == size, size > 0 {
+                    updateTransfer(transferID, status: .succeeded, detail: "远端已有完整文件", finishedAt: .now, completedBytes: size)
+                    return
                 }
-                await session.reload()
-            } catch {
-                updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
-                lastError = error.localizedDescription
+                let detail = offset > 0 ? "从 \(ByteCountFormatter.string(fromByteCount: offset, countStyle: .file)) 继续上传" : "正在上传"
+                updateTransfer(transferID, status: .running, detail: detail, startedAt: .now, completedBytes: offset)
+                try await session.client.upload(
+                    url,
+                    to: destination,
+                    resumeFrom: offset,
+                    progress: transferProgressHandler(for: transferID, offset: offset, totalBytes: size)
+                )
+                try Task.checkCancellation()
+                updateTransfer(transferID, status: .succeeded, detail: "上传完成", finishedAt: .now, completedBytes: size)
             }
+            await session.reload()
+        } catch {
+            guard !markTransferPausedIfCancelled(transferID) else { return }
+            updateTransfer(transferID, status: .failed, detail: error.localizedDescription, finishedAt: .now)
+            lastError = error.localizedDescription
         }
     }
 
@@ -464,6 +656,7 @@ final class WorkspaceStore: ObservableObject {
         transferID: UUID
     ) async throws {
         for (index, path) in plan.directories.enumerated() {
+            try Task.checkCancellation()
             updateTransfer(
                 transferID,
                 status: .running,
@@ -475,6 +668,7 @@ final class WorkspaceStore: ObservableObject {
         let totalBytes = plan.files.reduce(0) { $0 + $1.size }
         var completedBytes: Int64 = 0
         for (index, file) in plan.files.enumerated() {
+            try Task.checkCancellation()
             updateTransfer(
                 transferID,
                 status: .running,
@@ -485,6 +679,7 @@ final class WorkspaceStore: ObservableObject {
                 to: RemotePath.parent(of: file.remotePath),
                 progress: transferProgressHandler(for: transferID, offset: completedBytes, totalBytes: totalBytes)
             )
+            try Task.checkCancellation()
             completedBytes += file.size
             updateTransfer(
                 transferID,
@@ -513,40 +708,66 @@ final class WorkspaceStore: ObservableObject {
             connectionName: session.profile.name,
             totalBytes: item.isDirectory ? nil : item.size
         )
-        transfers.append(transfer)
-        Task {
-            do {
-                if item.isDirectory {
-                    updateTransfer(transfer.id, status: .running, detail: "正在读取远端文件夹", startedAt: .now)
-                    let plan = try await FolderDownloadPlan.make(root: item, client: session.client)
-                    if let totalBytes = plan.totalBytes { setTransferTotal(transfer.id, bytes: totalBytes) }
-                    let completedBytes = try await download(folder: plan, to: directory, client: session.client, transferID: transfer.id)
-                    updateTransfer(
-                        transfer.id,
-                        status: .succeeded,
-                        detail: "已下载 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹",
-                        finishedAt: .now,
-                        completedBytes: completedBytes
-                    )
-                } else {
-                    updateTransfer(transfer.id, status: .running, detail: "正在下载", startedAt: .now)
-                    try await session.client.download(
-                        item,
-                        to: directory.appendingPathComponent(item.name),
-                        progress: transferProgressHandler(for: transfer.id, totalBytes: item.size)
-                    )
-                    updateTransfer(
-                        transfer.id,
-                        status: .succeeded,
-                        detail: "下载完成",
-                        finishedAt: .now,
-                        completedBytes: item.size ?? 0
-                    )
+        enqueueTransfer(
+            transfer,
+            targetKey: "local:\(directory.standardizedFileURL.path)/\(item.name)"
+        ) { [weak self] in
+            await self?.performDownload(transferID: transfer.id, item: item, directory: directory, session: session)
+        }
+    }
+
+    private func performDownload(transferID: UUID, item: RemoteItem, directory: URL, session: RemoteSession) async {
+        do {
+            if item.isDirectory {
+                updateTransfer(transferID, status: .running, detail: "正在读取远端文件夹", startedAt: .now)
+                let plan = try await FolderDownloadPlan.make(root: item, client: session.client)
+                try Task.checkCancellation()
+                if let totalBytes = plan.totalBytes { setTransferTotal(transferID, bytes: totalBytes) }
+                let completedBytes = try await download(folder: plan, to: directory, client: session.client, transferID: transferID)
+                updateTransfer(
+                    transferID,
+                    status: .succeeded,
+                    detail: "已下载 \(plan.files.count) 个文件，创建 \(plan.directories.count) 个文件夹",
+                    finishedAt: .now,
+                    completedBytes: completedBytes
+                )
+            } else {
+                let destination = directory.appendingPathComponent(item.name)
+                let partial = directory.appendingPathComponent(".\(item.name).\(transferID.uuidString).cloudshelf-part")
+                let supportsResume = await session.client.supportsResumableTransfers()
+                let canResume = supportsResume && resumableTransferIDs.contains(transferID)
+                let resumeOffset = canResume ? localResumeOffset(at: partial, maximum: item.size) : 0
+                if resumeOffset == 0, FileManager.default.fileExists(atPath: partial.path) {
+                    try FileManager.default.removeItem(at: partial)
                 }
-            } catch {
-                updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
-                lastError = error.localizedDescription
+                try Task.checkCancellation()
+                if let size = item.size, resumeOffset == size, size > 0 {
+                    try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+                    try FileManager.default.moveItem(at: partial, to: destination)
+                    resumableTransferIDs.remove(transferID)
+                    updateTransfer(transferID, status: .succeeded, detail: "已完成续传", finishedAt: .now, completedBytes: size)
+                    return
+                }
+                let detail = resumeOffset > 0 ? "从 \(ByteCountFormatter.string(fromByteCount: resumeOffset, countStyle: .file)) 继续下载" : "正在下载"
+                updateTransfer(transferID, status: .running, detail: detail, startedAt: .now, completedBytes: resumeOffset)
+                try await session.client.download(
+                    item,
+                    to: partial,
+                    resumeFrom: resumeOffset,
+                    progress: transferProgressHandler(for: transferID, offset: resumeOffset, totalBytes: item.size)
+                )
+                try Task.checkCancellation()
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+                try FileManager.default.moveItem(at: partial, to: destination)
+                resumableTransferIDs.remove(transferID)
+                updateTransfer(transferID, status: .succeeded, detail: "下载完成", finishedAt: .now, completedBytes: item.size ?? 0)
             }
+        } catch {
+            guard !markTransferPausedIfCancelled(transferID) else { return }
+            updateTransfer(transferID, status: .failed, detail: error.localizedDescription, finishedAt: .now)
+            lastError = error.localizedDescription
         }
     }
 
@@ -557,6 +778,7 @@ final class WorkspaceStore: ObservableObject {
         transferID: UUID
     ) async throws -> Int64 {
         for (index, remoteDirectory) in plan.directories.enumerated() {
+            try Task.checkCancellation()
             updateTransfer(
                 transferID,
                 status: .running,
@@ -570,6 +792,7 @@ final class WorkspaceStore: ObservableObject {
 
         var completedBytes: Int64 = 0
         for (index, remoteFile) in plan.files.enumerated() {
+            try Task.checkCancellation()
             updateTransfer(
                 transferID,
                 status: .running,
@@ -585,6 +808,7 @@ final class WorkspaceStore: ObservableObject {
                     useReportedTotal: plan.totalBytes != nil
                 )
             )
+            try Task.checkCancellation()
             completedBytes += remoteFile.size ?? 0
             updateTransfer(
                 transferID,
@@ -598,39 +822,71 @@ final class WorkspaceStore: ObservableObject {
 
     private func enqueueCopy(_ item: RemoteItem, destination: String, session: RemoteSession) {
         let transfer = TransferTask(direction: .sync, title: "复制 \(item.name)", connectionName: session.profile.name)
-        transfers.append(transfer)
-        Task {
-            updateTransfer(transfer.id, status: .running, detail: "正在复制", startedAt: .now)
-            do {
+        enqueueTransfer(
+            transfer,
+            targetKey: "remote:\(session.profile.id.uuidString):\(RemotePath.join(destination, item.name))"
+        ) { [weak self] in
+            await self?.performRemoteOperation(transferID: transfer.id, detail: "正在复制", success: "复制完成", session: session) {
                 try await session.client.copy(item, to: destination)
-                updateTransfer(transfer.id, status: .succeeded, detail: "复制完成", finishedAt: .now)
-                await session.reload()
-            } catch {
-                updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
-                lastError = error.localizedDescription
             }
         }
     }
 
     private func enqueueMove(_ item: RemoteItem, destination: String, session: RemoteSession) {
         let transfer = TransferTask(direction: .sync, title: "移动 \(item.name)", connectionName: session.profile.name)
-        transfers.append(transfer)
-        Task {
-            updateTransfer(transfer.id, status: .running, detail: "正在移动", startedAt: .now)
-            do {
+        enqueueTransfer(
+            transfer,
+            targetKey: "remote:\(session.profile.id.uuidString):\(RemotePath.join(destination, item.name))"
+        ) { [weak self] in
+            await self?.performRemoteOperation(transferID: transfer.id, detail: "正在移动", success: "移动完成", session: session) {
                 try await session.client.move(item, to: destination)
-                updateTransfer(transfer.id, status: .succeeded, detail: "移动完成", finishedAt: .now)
-                await session.reload()
-            } catch {
-                updateTransfer(transfer.id, status: .failed, detail: error.localizedDescription, finishedAt: .now)
-                lastError = error.localizedDescription
             }
         }
     }
 
+    private func performRemoteOperation(
+        transferID: UUID,
+        detail: String,
+        success: String,
+        session: RemoteSession,
+        operation: @escaping () async throws -> Void
+    ) async {
+        updateTransfer(transferID, status: .running, detail: detail, startedAt: .now)
+        do {
+            try Task.checkCancellation()
+            try await operation()
+            try Task.checkCancellation()
+            updateTransfer(transferID, status: .succeeded, detail: success, finishedAt: .now)
+            await session.reload()
+        } catch {
+            guard !markTransferPausedIfCancelled(transferID) else { return }
+            updateTransfer(transferID, status: .failed, detail: error.localizedDescription, finishedAt: .now)
+            lastError = error.localizedDescription
+        }
+    }
+
+    private func localResumeOffset(at url: URL, maximum: Int64?) -> Int64 {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        if let maximum, size > maximum { return 0 }
+        return size
+    }
+
+    private func remoteResumeOffset(
+        for name: String,
+        in directory: String,
+        client: any RemoteClient,
+        maximum: Int64
+    ) async -> Int64 {
+        guard let items = try? await client.list(at: directory),
+              let existing = items.first(where: { !$0.isDirectory && $0.name == name }),
+              let size = existing.size else { return 0 }
+        return min(size, maximum)
+    }
+
     private func setTransferTotal(_ id: UUID, bytes: Int64) {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
-        transfers[index].totalBytes = bytes
+        transfers[index].totalBytes = max(0, bytes)
+        transfers[index].completedBytes = min(transfers[index].completedBytes, transfers[index].totalBytes ?? 0)
     }
 
     private func transferProgressHandler(
@@ -673,8 +929,13 @@ final class WorkspaceStore: ObservableObject {
         transfers[index].detail = detail
         if let startedAt { transfers[index].startedAt = startedAt }
         if let finishedAt { transfers[index].finishedAt = finishedAt }
-        if let completedBytes { transfers[index].completedBytes = completedBytes }
-        if let totalBytes { transfers[index].totalBytes = totalBytes }
+        if let totalBytes { transfers[index].totalBytes = max(0, totalBytes) }
+        if let completedBytes {
+            let completed = max(0, completedBytes)
+            transfers[index].completedBytes = transfers[index].totalBytes.map { min(completed, $0) } ?? completed
+        } else if let total = transfers[index].totalBytes {
+            transfers[index].completedBytes = min(transfers[index].completedBytes, total)
+        }
         let elapsed = (finishedAt ?? .now).timeIntervalSince(transfers[index].startedAt ?? .now)
         if transfers[index].completedBytes > 0, elapsed > 0 {
             transfers[index].bytesPerSecond = Double(transfers[index].completedBytes) / elapsed

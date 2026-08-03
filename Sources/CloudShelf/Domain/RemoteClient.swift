@@ -12,16 +12,29 @@ public protocol RemoteClient: Sendable {
     func upload(_ localURL: URL, to directory: String) async throws
     func download(_ item: RemoteItem, to localURL: URL, progress: TransferProgressHandler?) async throws
     func upload(_ localURL: URL, to directory: String, progress: TransferProgressHandler?) async throws
+    func supportsResumableTransfers() async -> Bool
+    func download(_ item: RemoteItem, to localURL: URL, resumeFrom: Int64, progress: TransferProgressHandler?) async throws
+    func upload(_ localURL: URL, to directory: String, resumeFrom: Int64, progress: TransferProgressHandler?) async throws
     func copy(_ item: RemoteItem, to directory: String) async throws
 }
 
-extension RemoteClient {
+public extension RemoteClient {
     func download(_ item: RemoteItem, to localURL: URL, progress: TransferProgressHandler?) async throws {
         try await download(item, to: localURL)
     }
 
     func upload(_ localURL: URL, to directory: String, progress: TransferProgressHandler?) async throws {
         try await upload(localURL, to: directory)
+    }
+
+    func supportsResumableTransfers() async -> Bool { false }
+
+    func download(_ item: RemoteItem, to localURL: URL, resumeFrom: Int64, progress: TransferProgressHandler?) async throws {
+        try await download(item, to: localURL, progress: progress)
+    }
+
+    func upload(_ localURL: URL, to directory: String, resumeFrom: Int64, progress: TransferProgressHandler?) async throws {
+        try await upload(localURL, to: directory, progress: progress)
     }
 
     func copy(_ item: RemoteItem, to directory: String) async throws {
